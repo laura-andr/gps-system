@@ -42,6 +42,7 @@ unsigned long lastUpdate;
 unsigned long gpsStartTime;
 String gpsData;
 String nmeaSentence;
+String gpsFields[18];
 
 //function headers
 void stop();
@@ -70,7 +71,7 @@ void setup() {
   delay(500);
 
   while(Serial2.available()){
-    Serial2.read();
+    Serial.write(Serial2.read());
   }
   delay(1000);
   sendAT("AT+IPR=115200", TO_LOCAL);
@@ -86,7 +87,16 @@ void setup() {
 void loop() {
   if (millis() - lastUpdate >= (GPS_INTERVAL * 1000)){
     lastUpdate = millis();
+    String lat = gpsFields[5];
+    String lon = gpsFields[7];
     if (getGPS()){
+      if (gpsFields[6]=="W"){
+        lat = "-"+lat;
+      }
+      if (gpsFields[8] == "S"){
+        lon = "-"+lon;
+      }
+      sendToCloud(gpsFields[10], lat, lon);
       startSocket();
       if(!sendNmeaToSocket()){
         addError(ERR_SOCKET_MSG_FAILURE);
@@ -165,6 +175,7 @@ bool ATNETOPEN(){
     while (millis() - start < timeout) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
+        Serial.write(c);
         if (c == '\n') {
           curLine.trim();
           if (curLine.length() > 0) {
@@ -208,7 +219,7 @@ bool ATNETCLOSE(){
   for (int tries = 0; tries<4; tries++) {
 
     while(Serial2.available()){
-      Serial2.read(); //get rid of write only for testing purposes
+      Serial.write(Serial2.read()); //get rid of write only for testing purposes
     }
 
     bool retry = false;
@@ -220,18 +231,19 @@ bool ATNETCLOSE(){
     while (millis() - start < timeout) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
+        Serial.write(c);
         if (c == '\n') {
           curLine.trim();
           if (curLine.length() > 0) {
             if (curLine.indexOf("OK")!=-1){
               while(Serial2.available()){
-                Serial2.read();
+                Serial.write(Serial2.read());
               }
               return true;
             }
             if (curLine.indexOf("OK")!=-1 || curLine.indexOf("+NETCLOSE: 2")!=-1 || curLine.indexOf("+NETCLOSE: 0")!=-1){
               while(Serial2.available()){
-                Serial2.read();
+                Serial.write(Serial2.read());
               }
               return true;
             }
@@ -265,7 +277,7 @@ bool ATCIPOPEN(){
   for (int tries = 0; tries<4; tries++) {
 
     while(Serial2.available()){
-      Serial2.read();
+      Serial.write(Serial2.read());
     }
 
     bool retry = false;
@@ -278,6 +290,7 @@ bool ATCIPOPEN(){
     while (millis() - start < timeout) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
+        Serial.write(c);
         if (c == '\n') {
           curLine.trim();
           if (curLine.length() > 0) {
@@ -326,6 +339,7 @@ String sendAT(String msg, unsigned long timeout) {
     while (millis() - start < timeout) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
+        Serial.write(c);
         if (c == '\n') {
           curLine.trim();
           if (curLine.length() > 0) {
@@ -362,7 +376,6 @@ void setupGPS(){
   sendAT("AT+CGNSSPWR=0", TO_LOCAL);
   delay(500);
   Serial2.println("AT+CGNSSPWR=1");
-  
   // wait for READY, not just OK
   unsigned long start = millis();
   bool ready = false;
@@ -370,6 +383,7 @@ void setupGPS(){
   while (millis() - start < 10000){
     while (Serial2.available()){
       char c = Serial2.read();
+      Serial.write(c);
       if (c == '\n'){
         curLine.trim();
         if (curLine.indexOf("OK") != -1){
@@ -387,6 +401,8 @@ void setupGPS(){
     addError(ERR_GPS_INIT);
     stop();
   }
+  sendAT("AT+CGNSSMODE=15", TO_LOCAL);
+  sendAT("AT+GPSWARM", TO_LOCAL);
 
   gpsStartTime = millis();
 }
@@ -462,6 +478,7 @@ bool getGPS(){
 
   while (Serial2.available() > 0){
     char c = Serial2.read();
+    Serial.write(c);
     if (c == '\n'){
       curLine.trim();
       if (curLine.length() > 0 && curLine.indexOf("+CGNSSINFO:") != -1){
@@ -479,7 +496,7 @@ bool getGPS(){
 
   if (!foundData) return false;
 
-  String gpsFields[18];
+  
   gpsDataToArray(gpsData, ',', gpsFields, 18);
 
   if (gpsFields[0] == "" || gpsFields[0] == "0" || gpsFields[5] == "" || gpsFields[7] == ""){
@@ -496,7 +513,7 @@ bool getGPS(){
 
 bool sendNmeaToSocket(){
   while (Serial2.available()){
-    Serial2.read(); 
+    Serial.write(Serial2.read()); 
   } 
   
 
@@ -512,7 +529,7 @@ bool sendNmeaToSocket(){
   while (millis() - start < TO_SOCKET){
     while (Serial2.available() > 0){
       char c = Serial2.read();
-
+      Serial.write(c);
       if (c == '>') {
         Serial2.print(payload);
         dataSent = true;
@@ -536,7 +553,7 @@ bool sendNmeaToSocket(){
   while (millis() - start < 10000) { 
     while (Serial2.available() > 0) {
       char c = Serial2.read();
-
+      Serial.write(c);
       if (c == '\n') {
         curLine.trim();
         if (curLine.length() > 0) {
@@ -555,4 +572,23 @@ bool sendNmeaToSocket(){
   }
 
   return remoteClosed; 
+}
+void sendToCloud(String timestamp, String lat, String lon) {
+  sendAT("AT+HTTPINIT", TO_CELL);
+  delay(500);
+  
+  // !!! PASTE YOUR UNIQUE DEPLOYED WEBB APP MACRO ID HERE !!!
+  String baseGscriptUrl = "https://script.google.com/macros/s/AKfycbwIKwOesM75fyv-lfDd0nT3sRtoRpyOc20rQMefB1oD_d4MJWq_5FwQwcZyw2L0twCj/exec?";
+  
+  String url = baseGscriptUrl;
+  url += "lat=" + lat;
+  url += "&lon=" + lon;
+  url += "&time=" + timestamp; 
+  
+  sendAT("AT+HTTPPARA=\"URL\",\"" + url + "\"", TO_CELL);
+  delay(500);
+  
+  sendAT("AT+HTTPACTION=0", TO_CELL); 
+  delay(5000); 
+  sendAT("AT+HTTPTERM", TO_CELL);
 }
