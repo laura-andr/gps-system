@@ -30,7 +30,14 @@ const String HOST = "www.botech.com.co";
 const String PORT = "9504";
 const String PATH = "/";
 const String DEVICE_ID = "189";
-const int GPS_INTERVAL = 10; // 20 second tracking interval
+const int GPS_INTERVAL = 10; // tracking interval in seconds
+const int NMEA_MAX_LENGTH = 82;
+const int GPS_DATA_ARRAY_SIZE = 1500;
+const int PACKAGE_SIZE = 100;
+
+const int THRESH_SPEED = 13; //in knots
+const int THRESH_DIST = 300; //in meters
+const int THRESH_BEARING = 10; //in degrees
 
 //timeouts
 const unsigned long TO_LOCAL = 2000;
@@ -41,12 +48,17 @@ const unsigned long TO_SOCKET = 30000;
 unsigned long lastUpdate;
 unsigned long gpsStartTime;
 String gpsData;
+String gpsFields[18];
 String nmeaSentence;
+char nmeaArray[NMEA_MAX_LENGTH][GPS_DATA_ARRAY_SIZE];
+int nmeaIndex = 0;
 
 //function headers
 void stop();
 void addError(int code);
 void waitForResponse();
+String ddToDegMin(String dd_str, bool isLatitude);
+double distanceMeters(double lat1, double lon1, double lat2, double lon2);
 int gpsDataToArray(String data, char separator, String* arrayOut, int maxItems);
 String addChecksum(String sentence);
 bool ATNETOPEN();
@@ -59,6 +71,9 @@ void fixLocation();
 void startSocket();
 bool getGPS();
 bool sendNmeaToSocket();
+void gpsDataToNmea();
+void addNmeaToArray();
+
 
 void setup() {
   delay(3000);
@@ -87,8 +102,11 @@ void loop() {
   if (millis() - lastUpdate >= (GPS_INTERVAL * 1000)){
     lastUpdate = millis();
     if (getGPS()){
+      //every successful getGPS will change the global nmeaSentence var
+      //we will also have the gpsFields include the current nmeaSentence
       startSocket();
       if(!sendNmeaToSocket()){
+        addNmeaToArray();
         addError(ERR_SOCKET_MSG_FAILURE);
       }
     }
@@ -121,6 +139,40 @@ void waitForResponse(){
       return;
     }
   }
+}
+
+// Convert decimal degrees in string form (dd.dddd or -dd.dddd) to NMEA degrees-minutes format:
+// latitude: ddmm.mmmm (2-digit degrees), longitude: dddmm.mmmm (3-digit degrees)
+String ddToDegMin(String dd_str, bool isLatitude) {
+  if (dd_str.length() == 0) return "";
+
+  double dd = dd_str.toFloat();
+  bool negative = dd < 0;
+  if (negative) dd = -dd;
+
+  int deg = (int)dd;
+  double frac = dd - deg;
+  double minutes = frac * 60.0;
+
+  char buf[16];
+  if (isLatitude) {
+    sprintf(buf, "%02d%07.4f", deg, minutes);
+  } else {
+    sprintf(buf, "%03d%07.4f", deg, minutes);
+  }
+
+  String out = String(buf);
+  return out;
+}
+
+// Haversine distance in meters between two geographic coordinates
+double distanceMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0; // Earth radius in meters
+  double dLat = (lat2 - lat1) * DEG_TO_RAD;
+  double dLon = (lon2 - lon1) * DEG_TO_RAD;
+  double a = sin(dLat/2) * sin(dLat/2) + cos(lat1 * DEG_TO_RAD) * cos(lat2 * DEG_TO_RAD) * sin(dLon/2) * sin(dLon/2);
+  double c = 2 * atan2(sqrt(a), sqrt(1-a));
+  return R * c;
 }
 
 int gpsDataToArray(String data, char separator, String* arrayOut, int maxItems) {
@@ -361,9 +413,8 @@ bool sendATincludes(String msg, String inclusion, unsigned long timeout){
 void setupGPS(){
   sendAT("AT+CGNSSPWR=0", TO_LOCAL);
   delay(500);
+
   Serial2.println("AT+CGNSSPWR=1");
-  
-  // wait for READY, not just OK
   unsigned long start = millis();
   bool ready = false;
   String curLine = "";
@@ -478,20 +529,58 @@ bool getGPS(){
   }
 
   if (!foundData) return false;
+  gpsDataToNmea();
+  return true;
+}
+//changes global var nmeaSentence to hold the NMEA sentence
+void gpsDataToNmea(){
 
-  String gpsFields[18];
   gpsDataToArray(gpsData, ',', gpsFields, 18);
 
   if (gpsFields[0] == "" || gpsFields[0] == "0" || gpsFields[5] == "" || gpsFields[7] == ""){
     nmeaSentence = "$GNRMC,,V,,,,,,,,,,N,V,"; 
   }
   else {
-    nmeaSentence = "$GNRMC," + gpsFields[10] + ",A," + gpsFields[5] + "," + gpsFields[6] + "," + 
-                  gpsFields[7] + "," + gpsFields[8] + "," + gpsFields[12] + "," + 
+    lat = ddToDegMin(gpsFields[5], true);
+    lon = ddToDegMin(gpsFields[7], false);
+    nmeaSentence = "$GNRMC," + gpsFields[10] + ",A," + lat + "," + gpsFields[6] + "," + 
+                  lon + "," + gpsFields[8] + "," + gpsFields[12] + "," + 
                   gpsFields[13] + "," + gpsFields[9] + ",,,A,V";
   }
   Serial.println(nmeaSentence);
-  return true;
+}
+
+void addNmeaToArray() {
+  if (gpsFields[12].toDouble() > THRESH_SPEED) {
+    nmeaIndex++;
+    nmeaArray[nmeaIndex] = nmeaSentence;
+    return;
+  }
+
+  if (nmeaIndex != 0) {
+    double lastLat = nmeaArray[nmeaIndex - 1].substring(5, 12).toDouble();
+    double lastLon = nmeaArray[nmeaIndex - 1].substring(13, 21).toDouble();
+    double currLat = gpsFields[5].toDouble();
+    double currLon = gpsFields[7].toDouble();
+    double degrees = gpsFields[13].toDouble();
+
+    if (distanceMeters(lastLat, lastLon, currLat, currLon) > THRESH_DIST) {
+      nmeaIndex++;
+      nmeaArray[nmeaIndex] = nmeaSentence;
+      return;
+    }
+
+    if (abs(degrees - degrees) > THRESH_BEARING) {
+      nmeaIndex++;
+      nmeaArray[nmeaIndex] = nmeaSentence;
+      return;
+    }
+  }
+
+  //also if we have run out of spots, think of some way to reduce data size print without losing too much fidelity
+  if (nmeaIndex < NMEA_MAX_LENGTH) {
+    nmeaArray[nmeaIndex++] = nmeaSentence;
+  }
 }
 
 bool sendNmeaToSocket(){
@@ -503,40 +592,40 @@ bool sendNmeaToSocket(){
   String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
   
   String sendCmd = "AT+CIPSEND=0," + String(payload.length());
-  Serial2.println(sendCmd);
-
-  unsigned long start = millis();
-  String curLine = "";
+  unsigned long startAll = millis();
+  int tries = 0;
   bool dataSent = false;
 
-  while (millis() - start < TO_SOCKET){
-    while (Serial2.available() > 0){
-      char c = Serial2.read();
-
-      if (c == '>') {
-        Serial2.print(payload);
-        dataSent = true;
-        curLine = "";
-        break;
+  while (tries < 3 && (millis() - startAll) < TO_SOCKET && !dataSent) {
+    while (Serial2.available()) Serial2.read();
+    Serial2.println(sendCmd);
+    String curLine = "";
+    while ((millis() - startAll) < TO_SOCKET) {
+      while (Serial2.available() > 0) {
+        char c = Serial2.read();
+        if (c == '>') {
+          Serial2.print(payload);
+          dataSent = true;
+          curLine = "";
+          break;
+        }
       }
+      if (dataSent) break;
+      yield();
     }
-    if (dataSent) break;
-    yield();
+
+    if (!dataSent) {
+      sendAT("AT+CIPCLOSE=0", TO_LOCAL);
+      tries++;
+      delay(200);
+    }
   }
 
-  if (!dataSent) {
-    sendAT("AT+CIPCLOSE=0", TO_LOCAL);
-    return false;
-  }
-
-  start = millis();
-  curLine = "";
+  String curLine = "";
   bool remoteClosed = false;
-
-  while (millis() - start < 10000) { 
+  while ((millis() - startAll) < TO_SOCKET) {
     while (Serial2.available() > 0) {
       char c = Serial2.read();
-
       if (c == '\n') {
         curLine.trim();
         if (curLine.length() > 0) {
@@ -554,5 +643,24 @@ bool sendNmeaToSocket(){
     yield();
   }
 
-  return remoteClosed; 
+  return remoteClosed;
+}
+
+void sendOldNmeaToSocket(){
+  String json = "{ \"nmea\": [";
+  int index = PACKAGE_SIZE;
+  if (nmeaIndex < PACKAGE_SIZE){
+    index = nmeaIndex;
+  }
+  for (int i = 0; i < index; i++) {
+    if (nmeaArray[i] != "") {
+      json += "\"" + nmeaArray[i] + "\",";
+    }
+  }
+  json.remove(json.length() - 1);
+  json += "] }";
+
+  // send json to socket
+  Serial2.println("AT+CIPSEND=0," + String(json.length()));
+  Serial2.print(json);
 }
