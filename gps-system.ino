@@ -50,7 +50,7 @@ unsigned long gpsStartTime;
 String gpsData;
 String gpsFields[18];
 String nmeaSentence;
-char nmeaArray[NMEA_MAX_LENGTH][GPS_DATA_ARRAY_SIZE];
+String nmeaArray[NMEA_MAX_LENGTH];
 int nmeaIndex = 0;
 
 //function headers
@@ -163,6 +163,17 @@ String ddToDegMin(String dd_str, bool isLatitude) {
 
   String out = String(buf);
   return out;
+}
+
+// Haversine distance in meters between two geographic coordinates
+double distanceMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0; // Earth radius in meters
+  const double deg2rad = 3.14159265358979323846 / 180.0;
+  double dLat = (lat2 - lat1) * deg2rad;
+  double dLon = (lon2 - lon1) * deg2rad;
+  double a = sin(dLat/2.0) * sin(dLat/2.0) + cos(lat1 * deg2rad) * cos(lat2 * deg2rad) * sin(dLon/2.0) * sin(dLon/2.0);
+  double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+  return R * c;
 }
 
 int gpsDataToArray(String data, char separator, String* arrayOut, int maxItems) {
@@ -653,8 +664,14 @@ void sendOldNmeaToSocket(){
       json += "\"" + nmeaArray[i] + "\",";
     }
   }
-  json.remove(json.length() - 1);
-  json += "] }";
+  // If we added at least one item, remove trailing comma and close the array.
+  if (json.endsWith(",")) {
+    json.remove(json.length() - 1);
+    json += "] }";
+  } else {
+    // No items were added; close empty array.
+    json += "] }";
+  }
 
   // send json to socket
   Serial2.println("AT+CIPSEND=0," + String(json.length()));
