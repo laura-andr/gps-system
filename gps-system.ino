@@ -1,4 +1,4 @@
-//import libraries
+//import libraries 
 #include  <Arduino.h>
 
 //define physical pins
@@ -71,8 +71,8 @@ void fixLocation();
 void startSocket();
 bool getGPS();
 bool sendNmeaToSocket();
-void gpsDataToNmea();
 void addNmeaToArray();
+void buildNmea();
 
 
 void setup() {
@@ -85,7 +85,7 @@ void setup() {
   delay(500);
 
   while(Serial2.available()){
-    Serial2.read();
+    Serial.write(Serial2.read());
   }
   delay(1000);
   sendAT("AT+IPR=115200", TO_LOCAL);
@@ -165,16 +165,6 @@ String ddToDegMin(String dd_str, bool isLatitude) {
   return out;
 }
 
-// Haversine distance in meters between two geographic coordinates
-double distanceMeters(double lat1, double lon1, double lat2, double lon2) {
-  const double R = 6371000.0; // Earth radius in meters
-  double dLat = (lat2 - lat1) * DEG_TO_RAD;
-  double dLon = (lon2 - lon1) * DEG_TO_RAD;
-  double a = sin(dLat/2) * sin(dLat/2) + cos(lat1 * DEG_TO_RAD) * cos(lat2 * DEG_TO_RAD) * sin(dLon/2) * sin(dLon/2);
-  double c = 2 * atan2(sqrt(a), sqrt(1-a));
-  return R * c;
-}
-
 int gpsDataToArray(String data, char separator, String* arrayOut, int maxItems) {
   int arrayIndex = 0;
   int fromIndex = 0;
@@ -217,6 +207,7 @@ bool ATNETOPEN(){
     while (millis() - start < timeout) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
+        Serial.write(c);
         if (c == '\n') {
           curLine.trim();
           if (curLine.length() > 0) {
@@ -254,13 +245,11 @@ bool ATNETOPEN(){
 }
 
 bool ATNETCLOSE(){
-  //we only care to check that this operation has finished <-- true
-  //or if it timed out <-- false
   unsigned long timeout = TO_SOCKET;
   for (int tries = 0; tries<4; tries++) {
 
     while(Serial2.available()){
-      Serial2.read(); //get rid of write only for testing purposes
+      Serial.write(Serial2.read()); 
     }
 
     bool retry = false;
@@ -272,18 +261,19 @@ bool ATNETCLOSE(){
     while (millis() - start < timeout) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
+        Serial.write(c);
         if (c == '\n') {
           curLine.trim();
           if (curLine.length() > 0) {
             if (curLine.indexOf("OK")!=-1){
               while(Serial2.available()){
-                Serial2.read();
+                Serial.write(Serial2.read());
               }
               return true;
             }
             if (curLine.indexOf("OK")!=-1 || curLine.indexOf("+NETCLOSE: 2")!=-1 || curLine.indexOf("+NETCLOSE: 0")!=-1){
               while(Serial2.available()){
-                Serial2.read();
+                Serial.write(Serial2.read());
               }
               return true;
             }
@@ -317,7 +307,7 @@ bool ATCIPOPEN(){
   for (int tries = 0; tries<4; tries++) {
 
     while(Serial2.available()){
-      Serial2.read();
+      Serial.write(Serial2.read());
     }
 
     bool retry = false;
@@ -330,6 +320,7 @@ bool ATCIPOPEN(){
     while (millis() - start < timeout) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
+        Serial.write(c);
         if (c == '\n') {
           curLine.trim();
           if (curLine.length() > 0) {
@@ -337,7 +328,6 @@ bool ATCIPOPEN(){
               if(curLine.indexOf("+CIPOPEN: 0,0")!=-1){
                 return true;
               }
-              //otherwise there was some error, try again
               retry = true;
               break;
             }
@@ -378,6 +368,7 @@ String sendAT(String msg, unsigned long timeout) {
     while (millis() - start < timeout) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
+        Serial.write(c);
         if (c == '\n') {
           curLine.trim();
           if (curLine.length() > 0) {
@@ -413,7 +404,6 @@ bool sendATincludes(String msg, String inclusion, unsigned long timeout){
 void setupGPS(){
   sendAT("AT+CGNSSPWR=0", TO_LOCAL);
   delay(500);
-
   Serial2.println("AT+CGNSSPWR=1");
   unsigned long start = millis();
   bool ready = false;
@@ -421,6 +411,7 @@ void setupGPS(){
   while (millis() - start < 10000){
     while (Serial2.available()){
       char c = Serial2.read();
+      Serial.write(c);
       if (c == '\n'){
         curLine.trim();
         if (curLine.indexOf("OK") != -1){
@@ -513,6 +504,7 @@ bool getGPS(){
 
   while (Serial2.available() > 0){
     char c = Serial2.read();
+    Serial.write(c);
     if (c == '\n'){
       curLine.trim();
       if (curLine.length() > 0 && curLine.indexOf("+CGNSSINFO:") != -1){
@@ -529,11 +521,11 @@ bool getGPS(){
   }
 
   if (!foundData) return false;
-  gpsDataToNmea();
+  buildNmea();
   return true;
 }
-//changes global var nmeaSentence to hold the NMEA sentence
-void gpsDataToNmea(){
+
+void buildNmea(){
 
   gpsDataToArray(gpsData, ',', gpsFields, 18);
 
@@ -541,8 +533,8 @@ void gpsDataToNmea(){
     nmeaSentence = "$GNRMC,,V,,,,,,,,,,N,V,"; 
   }
   else {
-    lat = ddToDegMin(gpsFields[5], true);
-    lon = ddToDegMin(gpsFields[7], false);
+    String lat = ddToDegMin(gpsFields[5], true);
+    String lon = ddToDegMin(gpsFields[7], false);
     nmeaSentence = "$GNRMC," + gpsFields[10] + ",A," + lat + "," + gpsFields[6] + "," + 
                   lon + "," + gpsFields[8] + "," + gpsFields[12] + "," + 
                   gpsFields[13] + "," + gpsFields[9] + ",,,A,V";
@@ -585,7 +577,7 @@ void addNmeaToArray() {
 
 bool sendNmeaToSocket(){
   while (Serial2.available()){
-    Serial2.read(); 
+    Serial.write(Serial2.read()); 
   } 
   
 
@@ -597,12 +589,15 @@ bool sendNmeaToSocket(){
   bool dataSent = false;
 
   while (tries < 3 && (millis() - startAll) < TO_SOCKET && !dataSent) {
-    while (Serial2.available()) Serial2.read();
+    while (Serial2.available()) {
+      Serial.write(Serial2.read());
+    }
     Serial2.println(sendCmd);
     String curLine = "";
     while ((millis() - startAll) < TO_SOCKET) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
+        Serial.write(c);
         if (c == '>') {
           Serial2.print(payload);
           dataSent = true;
@@ -626,6 +621,7 @@ bool sendNmeaToSocket(){
   while ((millis() - startAll) < TO_SOCKET) {
     while (Serial2.available() > 0) {
       char c = Serial2.read();
+      Serial.write(c);
       if (c == '\n') {
         curLine.trim();
         if (curLine.length() > 0) {
