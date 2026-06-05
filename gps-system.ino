@@ -19,6 +19,7 @@
 #define ERR_NET_IP 305
 #define ERR_INIT_SOCKET_CONNECTION 400
 #define ERR_SOCKET_MSG_FAILURE 401
+#define ERR_LIGHTSLEEP 500
 
 //define error log
 int errorLog[64];
@@ -30,7 +31,8 @@ const String HOST = "www.botech.com.co";
 const String PORT = "9504";
 const String PATH = "/";
 const String DEVICE_ID = "189";
-const int GPS_INTERVAL = 10; // tracking interval in seconds
+unsigned long ACTIVE_GPS_INTERVAL = 10; // active mode tracking interval in seconds
+unsigned long IDLE_GPS_INTERVAL = 15*60; // idle mode tracking interval
 const int NMEA_MAX_LENGTH = 82;
 const int GPS_DATA_ARRAY_SIZE = 1500;
 const int PACKAGE_SIZE = 100;
@@ -50,8 +52,7 @@ unsigned long gpsStartTime;
 String gpsData;
 String gpsFields[18];
 String nmeaSentence;
-char nmeaArray[NMEA_MAX_LENGTH][GPS_DATA_ARRAY_SIZE];
-int nmeaIndex = 0;
+bool isActive = false;
 
 //function headers
 void stop();
@@ -91,6 +92,7 @@ void setup() {
   delay(1000);
   setupGPS();
   setupPDP();
+  sendAT("AT+CSIMSLEEP=1", TO_LOCAL);
   fixLocation();
   startSocket();
 
@@ -98,13 +100,46 @@ void setup() {
 }
 
 void loop() {
-  if (millis() - lastUpdate >= (GPS_INTERVAL * 1000)){
+  if (isActive && millis() - lastUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
     lastUpdate = millis();
     if (getGPS()){
       startSocket();
       if(!sendNmeaToSocket()){
         addError(ERR_SOCKET_MSG_FAILURE);
       }
+    }
+  }
+  else {
+    unsigned long sinceLastWakeup = millis() - lastUpdate;
+    lastUpdate = millis();    
+    uint64_t sleepMs = IDLE_GPS_INTERVAL * 1000;
+    if (sleepMs > sinceLastWakeup) {
+      sleepMs -= sinceLastWakeup;
+    } else {
+      sleepMs = 1000; // Small recovery delay if we overshot budget
+    }
+    uint64_t interval = sleepMs * 1000ULL;
+    sendAT("AT+CGNSSWAKEUP", TO_LOCAL);
+    if (getGPS()){
+      startSocket();
+      if(!sendNmeaToSocket()){
+        addError(ERR_SOCKET_MSG_FAILURE);
+      }
+    }
+    int count = 0;
+    bool failed = false;
+    while (ESP_OK != esp_sleep_enable_timer_wakeup(interval)){
+      if (count == 3){
+        addError(ERR_LIGHTSLEEP);
+        failed = true;
+      }
+      yield();
+      count++;
+    }
+    if (!failed){
+      sendAT("AT+CGNSSSLEEP", TO_LOCAL);
+      Serial.flush();
+      esp_light_sleep_start(); 
     }
   }
 }
@@ -115,10 +150,8 @@ void stop() {
     Serial.println(errorLog[i]);
   }
 
-  Serial.println("going into deep sleep");
-  while (true){
-    yield();
-  }
+  Serial.println("critical failure, restarting");
+  ESP.restart();
 }
 
 void addError(int code) {
