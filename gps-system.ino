@@ -19,6 +19,14 @@
 #define ERR_NET_IP 305
 #define ERR_INIT_SOCKET_CONNECTION 400
 #define ERR_SOCKET_MSG_FAILURE 401
+#define ERR_HTTP_INIT_FAILURE 500
+#define ERR_HTTP_GET_FAILURE 501
+#define ERR_VERSION_FILE_SIZE 502
+#define ERR_VERSION_FILE_READ 503
+#define ERR_FIRMWARE_SIZE 504
+#define ERR_INSUFFICIENT_SPACE 505
+#define ERR_READ_UPDATE 506
+#define ERR_UPDATE_FAILURE 507
 
 //define error log
 int errorLog[64];
@@ -30,6 +38,11 @@ const String HOST = "www.botech.com.co";
 const String PORT = "9504";
 const String PATH = "/";
 const String DEVICE_ID = "189";
+
+const int LOCAL_VERSION = 1;
+const String version_url = "http://your-public-server.com"; //version.txt
+const String firmware_url = "http://your-public-server.com"; //firmware.bin
+
 const int GPS_INTERVAL = 10; // tracking interval in seconds
 const int NMEA_MAX_LENGTH = 82;
 const int GPS_DATA_ARRAY_SIZE = 1500;
@@ -39,7 +52,8 @@ const int THRESH_SPEED = 13; //in knots
 const int THRESH_DIST = 300; //in meters
 const int THRESH_BEARING = 10; //in degrees
 
-//timeouts
+const String UPDATE_TIME_UTC = "070000.00"; //hhmmss.ss, set to 2am COT
+
 const unsigned long TO_LOCAL = 2000;
 const unsigned long TO_CELL = 10000;
 const unsigned long TO_SOCKET = 30000;
@@ -108,6 +122,154 @@ void loop() {
     }
   }
 }
+
+
+long httpGET(String url) {
+  int tries = 0;
+  while (tries<3){
+    sendAT("AT+HTTPTERM", TO_CELL); 
+    if (!sendATincludes("AT+HTTPINIT", "OK", TO_CELL)){
+      addError(ERR_HTTP_INIT_FAILURE);
+      tries++;
+      continue;
+    } 
+    if (!sendATincludes("AT+HTTPPARA=\"URL\",\"" + url + "\"", "OK", TO_CELL)){
+      addError(ERR_HTTP_GET_FAILURE);
+      tries++;
+      continue;
+    } 
+    
+    String response = sendAT("AT+HTTPACTION=0", 20000);
+    
+    int actionIdx = response.indexOf("+HTTPACTION:");
+    if (actionIdx != -1) {
+      int firstComma = response.indexOf(",", actionIdx);
+      int secondComma = response.indexOf(",", firstComma + 1);
+      String status = response.substring(firstComma + 1, secondComma);
+      
+      if (status == "200") {
+        String sizeStr = response.substring(secondComma + 1);
+        sizeStr.trim();
+        return sizeStr.toInt();
+      }
+    }
+    tries++;
+  }
+  addError(ERR_HTTP_GET_FAILURE);
+  return 0; 
+}
+
+int checkVersion() {
+  int tries = 0;
+  long size = httpGET(version_url);
+  if (size <= 0) {
+    addError(ERR_VERSION_FILE_SIZE);
+    return -1;
+  }
+  while (tries<3){
+    String response = sendAT("AT+HTTPREAD=0," + String(size), TO_CELL);
+  
+    int index = response.indexOf("+HTTPREAD: DATA,");
+    if (index == -1){
+      addError(ERR_VERSION_FILE_READ);
+      tries++;
+      continue;
+    }
+
+    int startIndex = response.indexOf("\n", index);
+    if (startIndex == -1){
+      addError(ERR_VERSION_FILE_READ);
+      tries++;
+      continue;
+    }
+    startIndex++;
+
+    String remoteVersionStr = response.substring(startIndex);
+    remoteVersionStr.trim();
+    
+    return remoteVersionStr.toInt();
+  }
+  return -1;
+}
+
+void downloadNewVersion() {
+  long totalSize = httpGET(firmware_url);
+  if (totalSize <= 0) {
+    addError(ERR_FIRMWARE_SIZE);
+    return;
+  }
+
+  if (!Update.begin(totalSize)) {
+    addError(ERR_INSUFFICIENT_SPACE);
+    return;
+  }
+
+  long remainingBytes = totalSize;
+  long currentPosition = 0;
+  const int chunkSize = 1024; 
+
+  while (remainingBytes > 0) {
+    int readLen = (remainingBytes > chunkSize) ? chunkSize : remainingBytes;
+    
+    String response = sendAT("AT+HTTPREAD=" + String(currentPosition) + "," + String(readLen), TO_CELL);
+    
+    int dataIdx = response.indexOf("+HTTPREAD: DATA,");
+    if (dataIdx == -1) {
+      addError(ERR_READ_UPDATE);
+      Update.abort();
+      return;
+    }
+
+    int bodyStartIdx = response.indexOf("\n", dataIdx);
+    if (bodyStartIdx == -1) {
+      addError(ERR_READ_UPDATE);
+      Update.abort();
+      return;
+    }
+    bodyStartIdx++; 
+
+    // Stream this specific response chunk into the ESP32 partition flash
+    int bytesWrittenThisChunk = 0;
+    for (int i = bodyStartIdx; i < response.length(); i++) {
+      // Avoid accidental parsing of trailing modem response markers like "OK"
+      if (bytesWrittenThisChunk >= readLen) break; 
+      
+      uint8_t b = response[i];
+      Update.write(&b, 1);
+      bytesWrittenThisChunk++;
+    }
+
+    remainingBytes -= bytesWrittenThisChunk;
+    currentPosition += bytesWrittenThisChunk;
+    Serial.printf("Progress: %.2f%%\n", ((float)currentPosition / totalSize) * 100);
+  }
+
+  if (Update.end() && Update.isFinished()) {
+    Serial.println("Success! Rebooting into new firmware...");
+    sendAT("AT+HTTPTERM", TO_CELL);
+    ESP.restart();
+  } else {
+    addError(UPDATE_FAILURE);
+    Serial.printf("Update failed. Error: %s\n", Update.errorString());
+  }
+}
+
+void doOTA() {
+  int remoteVersion = checkVersion();
+  
+  if (remoteVersion <= 0) {
+    return;
+  }
+  
+  Serial.printf("Current Version: %d | Server Version: %d\n", CURRENT_FIRMWARE_VERSION, remoteVersion);
+  
+  if (remoteVersion > LOCAL_VERSION) {
+    downloadNewVersion();
+  }
+  
+  sendAT("AT+HTTPTERM", TO_CELL);
+}
+
 
 //helper functions
 void stop() {
