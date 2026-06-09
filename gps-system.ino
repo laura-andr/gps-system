@@ -1,5 +1,6 @@
 //import libraries 
 #include  <Arduino.h>
+#include <Update.h>
 
 //define physical pins
 #define RX2 16
@@ -249,7 +250,7 @@ void downloadNewVersion() {
     sendAT("AT+HTTPTERM", TO_CELL);
     ESP.restart();
   } else {
-    addError(UPDATE_FAILURE);
+    addError(ERR_UPDATE_FAILURE);
     Serial.printf("Update failed. Error: %s\n", Update.errorString());
   }
 }
@@ -261,7 +262,7 @@ void doOTA() {
     return;
   }
   
-  Serial.printf("Current Version: %d | Server Version: %d\n", CURRENT_FIRMWARE_VERSION, remoteVersion);
+  Serial.printf("Current Version: %d | Server Version: %d\n", LOCAL_VERSION, remoteVersion);
   
   if (remoteVersion > LOCAL_VERSION) {
     downloadNewVersion();
