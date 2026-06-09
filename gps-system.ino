@@ -40,9 +40,10 @@ const String PORT = "9504";
 const String PATH = "/";
 const String DEVICE_ID = "189";
 
+//CHANGE THIS EVERY UPDATE!!
 const int LOCAL_VERSION = 1;
-const String version_url = "http://your-public-server.com"; //version.txt
-const String firmware_url = "http://your-public-server.com"; //firmware.bin
+const String version_url = "https://githubusercontent.com"; //version.txt
+const String firmware_url = "https://github.com"; //firmware.bin
 
 const int GPS_INTERVAL = 10; // tracking interval in seconds
 const int NMEA_MAX_LENGTH = 82;
@@ -134,6 +135,11 @@ long httpGET(String url) {
       tries++;
       continue;
     } 
+    if(!sendATincludes("AT+HTTPPARA=\"CID\",1", "OK", TO_CELL)){
+      addError(ERR_HTTP_INIT_FAILURE);
+      tries++;
+      continue;
+    }
     if (!sendATincludes("AT+HTTPPARA=\"URL\",\"" + url + "\"", "OK", TO_CELL)){
       addError(ERR_HTTP_GET_FAILURE);
       tries++;
