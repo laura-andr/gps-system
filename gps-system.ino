@@ -1,9 +1,27 @@
 //import libraries 
 #include <Arduino.h>
+#include <Wire.h> // Added for I2C communication with INA219
 
 //define physical pins
 #define RX2 16
 #define TX2 17
+#define I2C_SDA 21 
+#define I2C_SCL 22 
+
+// INA219 Register Addresses
+#define INA219_ADDR           0x43 // Set matching Python code (addr=0x43)
+#define _REG_CONFIG           0x00
+#define _REG_SHUNTVOLTAGE     0x01
+#define _REG_BUSVOLTAGE       0x02
+#define _REG_POWER            0x03
+#define _REG_CURRENT          0x04
+#define _REG_CALIBRATION      0x05
+
+// INA219 Driver Constants & Tracking Variable
+const uint16_t INA219_CAL_VALUE = 26868;
+const float INA219_CURRENT_LSB = 0.1524; // mA per bit
+const float INA219_POWER_LSB = 0.003048; // W per bit
+int lowVoltageCounter = 0;               // Replaces python 'low = 0'
 
 //Error Logs
 #define ERR_AT_TIMEOUT 100
@@ -57,7 +75,6 @@ int nmeaIndex = 0;
 int failuresToSend = 0;
 String curLocChannel = "0";
 String oldLocChannel = "1";
-bool isActive = false;
 
 //function headers
 void stop();
@@ -83,6 +100,14 @@ void addNmeaToArray();
 void buildNmea();
 void sendOldNmeaToSocket();
 bool isSocketConnected(String channel);
+void INA219_writeRegister(uint8_t reg, uint16_t value);
+uint16_t INA219_readRegister(uint8_t reg);
+void setupINA219();
+float INA219_getBusVoltage_V();
+float INA219_getShuntVoltage_mV();
+float INA219_getCurrent_mA();
+float INA219_getPower_W();
+void checkPowerStatus();
 
 void setup() {
   delay(3000);
@@ -92,6 +117,10 @@ void setup() {
     
   Serial2.println("AT");
   delay(500);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setTimeOut(50);
+  setupINA219();
 
   while(Serial2.available()){
     Serial.write(Serial2.read());
@@ -109,41 +138,44 @@ void setup() {
 }
 
 void loop() {
-  if (isActive && millis() - lastUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
-    lastUpdate = millis();
-    if (getGPS()){
-      startSocket(); 
-      
-      String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
-      if(!CIPSEND(payload, curLocChannel)){
-        failuresToSend++;
-        addNmeaToArray();
-        addError(ERR_SOCKET_MSG_FAILURE);
-      }
-      else{
-        failuresToSend = 0;
-        if (nmeaIndex > 0) {
-          sendOldNmeaToSocket();
-        }
-      }
-    }
-    
-    if (failuresToSend >= 3){
-      if (!sendATincludes("AT+CEREG?", "+CEREG: 0,1", TO_CELL)){
-        addError(ERR_NET_REGISTRATION);
-        sendAT("AT+COPS=2", TO_CELL);
-        sendAT("AT+COPS=0", TO_CELL);
-        
-        unsigned long regStart = millis();
-        while(millis() - regStart < 15000) {
-          if (sendATincludes("AT+CEREG?", "+CEREG: 0,1", TO_CELL)) break;
-          delay(1000);
-        }
-      }
-      else{
+  if (INA219_getCurrent_mA() > 0){
+    if(millis() - lastUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
+      lastUpdate = millis();
+      checkPowerStatus();
+      if (getGPS()){
         startSocket(); 
+        
+        String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
+        if(!CIPSEND(payload, curLocChannel)){
+          failuresToSend++;
+          addNmeaToArray();
+          addError(ERR_SOCKET_MSG_FAILURE);
+        }
+        else{
+          failuresToSend = 0;
+          if (nmeaIndex > 0) {
+            sendOldNmeaToSocket();
+          }
+        }
       }
-      failuresToSend = 0;
+      
+      if (failuresToSend >= 3){
+        if (!sendATincludes("AT+CEREG?", "+CEREG: 0,1", TO_CELL)){
+          addError(ERR_NET_REGISTRATION);
+          sendAT("AT+COPS=2", TO_CELL);
+          sendAT("AT+COPS=0", TO_CELL);
+          
+          unsigned long regStart = millis();
+          while(millis() - regStart < 15000) {
+            if (sendATincludes("AT+CEREG?", "+CEREG: 0,1", TO_CELL)) break;
+            delay(1000);
+          }
+        }
+        else{
+          startSocket(); 
+        }
+        failuresToSend = 0;
+      }
     }
   } else {
     unsigned long sinceLastWakeup = millis() - lastUpdate;
@@ -158,7 +190,8 @@ void loop() {
     sendAT("AT+CGNSSWAKEUP", TO_LOCAL);
     if (getGPS()){
       startSocket();
-      if(!sendNmeaToSocket()){
+      String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
+      if(!CIPSEND(payload, curLocChannel)){
         addError(ERR_SOCKET_MSG_FAILURE);
       }
     }
@@ -756,4 +789,90 @@ void sendOldNmeaToSocket(){
     }    
     nmeaIndex = writeIndex;
   }
+}
+
+// INA219 I2C Helper functions
+void INA219_writeRegister(uint8_t reg, uint16_t value) {
+  Wire.beginTransmission(INA219_ADDR);
+  Wire.write(reg);
+  Wire.write((value >> 8) & 0xFF); // High byte
+  Wire.write(value & 0xFF);        // Low byte
+  Wire.endTransmission();
+}
+
+uint16_t INA219_readRegister(uint8_t reg) {
+  Wire.beginTransmission(INA219_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission();
+  
+  Wire.requestFrom(INA219_ADDR, (uint8_t)2);
+  if (Wire.available() >= 2) {
+    uint16_t value = Wire.read() << 8;
+    value |= Wire.read();
+    return value;
+  }
+  return 0;
+}
+
+void setupINA219() {
+  // Config value calculated from Python: 
+  // (RANGE_16V << 13) | (DIV_2_80MV << 11) | (ADCRES_12BIT_32S << 7) | (ADCRES_12BIT_32S << 3) | SANDBVOLT_CONTINUOUS
+  // 0x0000 | 0x0800 | 0x0680 | 0x0068 | 0x0007 = 0x0EEF
+  uint16_t config = 0x0EEF; 
+  
+  INA219_writeRegister(_REG_CALIBRATION, INA219_CAL_VALUE);
+  INA219_writeRegister(_REG_CONFIG, config);
+  Serial.println("INA219 Initialized.");
+}
+
+float INA219_getBusVoltage_V() {
+  INA219_writeRegister(_REG_CALIBRATION, INA219_CAL_VALUE);
+  uint16_t value = INA219_readRegister(_REG_BUSVOLTAGE);
+  return (int16_t)(value >> 3) * 0.004;
+}
+
+float INA219_getShuntVoltage_mV() {
+  INA219_writeRegister(_REG_CALIBRATION, INA219_CAL_VALUE);
+  int16_t value = (int16_t)INA219_readRegister(_REG_SHUNTVOLTAGE);
+  return value * 0.01;
+}
+
+float INA219_getCurrent_mA() {
+  int16_t value = (int16_t)INA219_readRegister(_REG_CURRENT);
+  return value * INA219_CURRENT_LSB;
+}
+
+float INA219_getPower_W() {
+  INA219_writeRegister(_REG_CALIBRATION, INA219_CAL_VALUE);
+  int16_t value = (int16_t)INA219_readRegister(_REG_POWER);
+  return value * INA219_POWER_LSB;
+}
+
+void checkPowerStatus() {
+  float bus_voltage = INA219_getBusVoltage_V();
+  float shunt_voltage = INA219_getShuntVoltage_mV() / 1000.0;
+  float current = -INA219_getCurrent_mA();
+  float power = INA219_getPower_W();
+  
+  // Calculate battery percentage based on a 3.0V to 4.2V scale (1.2V span)
+  float p = (bus_voltage - 3.0) / 1.2 * 100.0;
+  if (p > 100.0) p = 100.0;
+  if (p < 0.0) p = 0.0;
+
+  Serial.print("Load Voltage:  ");
+  Serial.print(bus_voltage, 3);
+  Serial.println(" V");
+
+  Serial.print("Current:       ");
+  Serial.print(current / 1000.0, 3);
+  Serial.println(" A");
+
+  Serial.print("Power:         ");
+  Serial.print(power, 3);
+  Serial.println(" W");
+
+  Serial.print("Percent:       ");
+  Serial.print(p, 1);
+  Serial.println("%");
+
 }
