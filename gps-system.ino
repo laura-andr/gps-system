@@ -171,18 +171,32 @@ String ddToDegMin(String dd_str, bool isLatitude) {
   if (dd_str.length() == 0) return "";
 
   double dd = dd_str.toFloat();
-  bool negative = dd < 0;
+  bool negative = dd < 0.0;
   if (negative) dd = -dd;
 
   int deg = (int)dd;
-  double frac = dd - deg;
+  double frac = dd - (double)deg;
   double minutes = frac * 60.0;
 
-  char buf[16];
+  // handle rounding that would push minutes to 60.0000
+  long minFrac = (long)round((minutes - floor(minutes)) * 10000.0);
+  int minWhole = (int)floor(minutes);
+  if (minFrac >= 10000) {
+    minFrac = 0;
+    minWhole += 1;
+    if (minWhole >= 60) {
+      minWhole = 0;
+      deg += 1;
+    }
+  }
+
+  char buf[20];
   if (isLatitude) {
-    sprintf(buf, "%02d%07.4f", deg, minutes);
+    // degrees: 2 digits, minutes: 2 digits + '.' + 4 decimals
+    sprintf(buf, "%02d%02d.%04ld", deg, minWhole, minFrac);
   } else {
-    sprintf(buf, "%03d%07.4f", deg, minutes);
+    // degrees: 3 digits
+    sprintf(buf, "%03d%02d.%04ld", deg, minWhole, minFrac);
   }
 
   return String(buf);
