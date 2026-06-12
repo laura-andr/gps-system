@@ -66,6 +66,7 @@ double distanceMeters(double lat1_dm, double lon1_dm, double lat2_dm, double lon
 int csvToArray(String data, char separator, String* arrayOut, int maxItems);
 String addChecksum(String sentence);
 bool ATNETOPEN();
+bool ATNETCLOSE();
 bool ATCIPOPEN(String host, String port, String channel);
 String sendAT(String msg, unsigned long timeout);
 bool sendATincludes(String msg, String inclusion, unsigned long timeout);
@@ -107,7 +108,6 @@ void loop() {
   if (millis() - lastUpdate >= (GPS_INTERVAL * 1000)){
     lastUpdate = millis();
     if (getGPS()){
-      // Maintain persistent connections dynamically instead of resetting every 10s
       startSocket(); 
       
       String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
@@ -118,7 +118,6 @@ void loop() {
       }
       else{
         failuresToSend = 0;
-        // If history contains items, try pushing them out channel 1
         if (nmeaIndex > 0) {
           sendOldNmeaToSocket();
         }
@@ -138,7 +137,7 @@ void loop() {
         }
       }
       else{
-        setupPDP();
+        startSocket(); 
       }
       failuresToSend = 0;
     }
@@ -197,7 +196,7 @@ double calculateFlatDistance(double lat1, double lon1, double lat2, double lon2)
   double deltaLat = (lat1 - lat2) * m_per_deg_lat;
   double deltaLon = (lon1 - lon2) * m_per_deg_lon;
 
-  return sqrt(deltaLat * deltaLat + deltaLon * deltaLon);
+  return sqrt(deltaLat * deltaLat + deltaLon * deltaLon); 
 }
 
 double distanceMeters(double lat1_dm, double lon1_dm, double lat2_dm, double lon2_dm) {
@@ -356,7 +355,6 @@ bool ATCIPOPEN(String host, String port, String channel){
           curLine.trim();
           if (curLine.length() > 0) {
             if (curLine.indexOf("+CIPOPEN:")!=-1){
-              // Dynamically validate connection against target channel parameter
               if(curLine.indexOf("+CIPOPEN: " + channel + ",0")!=-1 || curLine.indexOf("+CIPOPEN: " + channel + ",4")!=-1){
                 return true;
               }
@@ -380,7 +378,6 @@ bool ATCIPOPEN(String host, String port, String channel){
     }
     addError(ERR_INIT_SOCKET_CONNECTION);
     sendAT("AT+CIPCLOSE=" + channel, TO_LOCAL);
-    setupPDP();
     delay(500);
   }
   addError(ERR_AT_FAILURE);
@@ -448,7 +445,6 @@ void setupGPS(){
 }
 
 void setupPDP(){
-
   if (sendATincludes("AT+CEREG=1", "ERROR", TO_CELL)){
     addError(ERR_NET_REGISTRATION);
     stop();
@@ -481,7 +477,6 @@ void setupPDP(){
    addError(ERR_NET_IP);
    stop();
   }
-  
 }
 
 void fixLocation(){
@@ -561,9 +556,9 @@ void buildNmea(){
 void addNmeaToArray() {
   if (nmeaIndex >= NMEA_MAX_LENGTH) return;
 
-  if (!(gpsFields[12].toDouble() > THRESH_SPEED)) return;
-
   if (nmeaIndex != 0) {
+    if (!(gpsFields[12].toDouble() > THRESH_SPEED)) return;
+
     String lastNmea = nmeaArray[nmeaIndex-1];
     String lastNmeaArray[14];
     csvToArray(lastNmea, ',', lastNmeaArray, 14);
@@ -588,6 +583,8 @@ void addNmeaToArray() {
   }
 
   nmeaArray[nmeaIndex++] = nmeaSentence;
+  Serial.print("Saved offline point. Current index: ");
+  Serial.println(nmeaIndex);
 }
 
 bool CIPSEND(String payload, String channel){
@@ -633,7 +630,6 @@ bool CIPSEND(String payload, String channel){
     }
 
     if (!dataSent) {
-      // Dynamic cleanup targeting the actual failing channel context
       sendAT("AT+CIPCLOSE=" + channel, TO_LOCAL); 
       tries++;
       delay(200);
@@ -642,13 +638,17 @@ bool CIPSEND(String payload, String channel){
 
   String curLine = "";
   bool remoteClosed = false;
-  while ((millis() - startAll) < TO_SOCKET) {
+  unsigned long waitAckStart = millis();
+  String serverResponse = ""; 
+
+  while ((millis() - waitAckStart) < 5000) { 
     while (Serial2.available() > 0) {
       char c = Serial2.read();
       Serial.write(c);
       if (c == '\n') {
         curLine.trim();
         if (curLine.length() > 0) {
+          serverResponse += curLine + "\n";
           if (curLine.indexOf("+IPCLOSE: " + channel + ",1") != -1) {
             remoteClosed = true;
             break;
@@ -662,7 +662,12 @@ bool CIPSEND(String payload, String channel){
     if (remoteClosed) break;
     yield();
   }
-  return dataSent; // Returns status based on whether payload was successfully pushed out
+  
+  if (channel == oldLocChannel && serverResponse.indexOf("Insertado con identificador") == -1) {
+    return false; 
+  }
+
+  return dataSent;
 }
 
 void sendOldNmeaToSocket(){
@@ -672,7 +677,7 @@ void sendOldNmeaToSocket(){
   String json = "[";
   for (int i = 0; i < itemsToSend; i++) {
     if (nmeaArray[i] != "") {
-      json += "{" + addChecksum(nmeaArray[i]) + "},";
+      json += "{" + addChecksum(nmeaArray[i]).substring(1) + "\r\n},";
     }
   }
 
@@ -681,7 +686,7 @@ void sendOldNmeaToSocket(){
   }
   json += "]";
 
-  String payload = ">IH=" + DEVICE_ID +","+ json + "<\r\n";
+  String payload = ">IH=" + DEVICE_ID + "," + json + "<\r\n";
 
   if (CIPSEND(payload, oldLocChannel)) {    
     for (int i = 0; i < itemsToSend; i++) {
