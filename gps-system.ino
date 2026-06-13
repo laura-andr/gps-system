@@ -42,7 +42,7 @@ const String DEVICE_ID = "189";
 
 //CHANGE THIS EVERY UPDATE!!
 const int LOCAL_VERSION = 0;
-const String version_url = "https://github.com/laura-andr/gps-system/blob/over-air-updates/version.txt"; //version.txt
+const String version_url = "https://raw.githubusercontent.com/laura-andr/gps-system/over-air-updates/version.txt";
 const String firmware_url = "https://github.com"; //firmware.bin
 
 const int GPS_INTERVAL = 10; // tracking interval in seconds
@@ -122,6 +122,9 @@ void loop() {
         addError(ERR_SOCKET_MSG_FAILURE);
       }
     }
+  }
+  if (gpsFields[10] >= UPDATE_TIME_UTC){
+    doOTA();
   }
 }
 
