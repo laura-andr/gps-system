@@ -41,9 +41,9 @@ const String DEVICE_ID = "189";
 
 //CHANGE THIS EVERY UPDATE!!
 const int LOCAL_VERSION = 0;
-const String version_url = "https://dl.dropboxusercontent.com/scl/fi/r0rhfi73h7iciwrlumrls/version.txt?rlkey=ddjovrejh5wg06vr26z63uvmu&st=9zyuv7eo&dl=1";
-const String firmware_url = "https://dl.dropboxusercontent.com/scl/fi/1x22iaxccj0rqc2e2tuvf/test-gps-code.ino.bin?rlkey=eh8112jyw16821s8k884o9d76&st=mp81a227&dl=1";
-//https://dl.dropboxusercontent.com/scl/fi/[your_firmware_id]/test-gps-code.ino.bin?rlkey=[your_firmware_key]&dl=1
+const String version_url = "https://github.com/laura-andr/gps-system/releases/latest/download/version.txt";
+const String firmware_url = "https://github.com/laura-andr/gps-system/releases/latest/download/test-gps-code.ino.bin";
+
 
 const int GPS_INTERVAL = 10; // tracking interval in seconds
 const int NMEA_MAX_LENGTH = 82;
@@ -160,6 +160,93 @@ void loop() {
   }
 }
 
+// Reads the Location header from the last HTTP response after a 3xx.
+String getRedirectLocation() {
+  String resp = sendAT("AT+HTTPHEAD", TO_CELL);
+  // Find "Location:" (case-insensitive-ish; GitHub uses "Location:")
+  int locIdx = resp.indexOf("Location:");
+  if (locIdx == -1) locIdx = resp.indexOf("location:");
+  if (locIdx == -1) return "";
+
+  int start = locIdx + 9; // past "Location:"
+  // skip spaces
+  while (start < resp.length() && resp.charAt(start) == ' ') start++;
+  int end = resp.indexOf("\r", start);
+  if (end == -1) end = resp.indexOf("\n", start);
+  if (end == -1) end = resp.length();
+
+  String loc = resp.substring(start, end);
+  loc.trim();
+  return loc;
+}
+
+// Fires HTTPACTION for the current URL, returns the status code via reference,
+// and the datalen as the function return. Sets actionRespOut for logging.
+int doHttpActionGet(long &dataLenOut, String &actionRespOut) {
+  Serial2.println("AT+HTTPACTION=0");
+  String actionResponse = "";
+  unsigned long actionStart = millis();
+  while (millis() - actionStart < 30000) {
+    if (Serial2.available() > 0) {
+      char c = Serial2.read();
+      actionResponse += c;
+      if (actionResponse.indexOf("+HTTPACTION:") != -1 && actionResponse.endsWith("\n")) break;
+    }
+    yield();
+  }
+  actionRespOut = actionResponse;
+
+  int actionIdx = actionResponse.indexOf("+HTTPACTION:");
+  if (actionIdx == -1) { dataLenOut = 0; return -1; }
+  int firstComma = actionResponse.indexOf(",", actionIdx);
+  int secondComma = actionResponse.indexOf(",", firstComma + 1);
+  int status = actionResponse.substring(firstComma + 1, secondComma).toInt();
+  String sizeStr = actionResponse.substring(secondComma + 1);
+  sizeStr.trim();
+  dataLenOut = sizeStr.toInt();
+  return status;
+}
+
+// Sets the URL param, fires the GET, and follows up to maxRedirects 3xx hops.
+// On success leaves the session open with the body buffered, returns datalen.
+// Returns -1 on failure.
+long httpGetFollowingRedirects(String url, int maxRedirects) {
+  for (int hop = 0; hop <= maxRedirects; hop++) {
+    if (!sendATincludes("AT+HTTPPARA=\"URL\",\"" + url + "\"", "OK", TO_CELL)) {
+      Serial.println("Failed to set URL param.");
+      return -1;
+    }
+
+    long dataLen = 0;
+    String actionResp = "";
+    int status = doHttpActionGet(dataLen, actionResp);
+    Serial.println("FULL ACTION RESP: [" + actionResp + "]");
+    Serial.printf("Hop %d -> status %d, datalen %ld\n", hop, status, dataLen);
+
+    if (status == 200) {
+      return dataLen;  // success; body is buffered, ready for HTTPREAD
+    }
+
+    if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+      String next = getRedirectLocation();
+      if (next.length() == 0) {
+        Serial.println("Got redirect but no Location header. Aborting.");
+        return -1;
+      }
+      Serial.println("Redirecting to: " + next);
+      url = next;
+      // loop again with the new URL
+      continue;
+    }
+
+    // Any other status (incl. 707) is a failure for this hop
+    Serial.printf("Unexpected status %d. Aborting.\n", status);
+    return -1;
+  }
+  Serial.println("Exceeded max redirects. Aborting.");
+  return -1;
+}
+
 long httpGET(String url) {
   int tries = 0;
 
@@ -176,11 +263,9 @@ long httpGET(String url) {
       continue;
     } 
 
-    // 3. Configure internal SSL Engine for SIM7670 (Context 0)
     sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); // Target TLS 1.2
     sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   // Ignore certificate validation chains
-    sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);  // Turn on Auto-SNI handling from URL
-    sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL);
+    sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);
     
     // 4. Bind the target URL string
     if (!sendATincludes("AT+HTTPPARA=\"URL\",\"" + url + "\"", "OK", TO_CELL)){
@@ -242,20 +327,29 @@ long httpGET(String url) {
 }
 
 int checkVersion() {
-  int tries = 0;
-  long size = httpGET(version_url); // This will correctly return 9
-  
+  // Open a fresh HTTP/SSL session for the version fetch.
+  sendAT("AT+HTTPTERM", TO_CELL);
+  delay(100);
+  sendAT("AT+HTTPINIT", TO_CELL);
+  delay(100);
+  sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); // Target TLS 1.2
+  sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   // Ignore certificate validation chains
+  sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);
+
+  long size = httpGetFollowingRedirects(version_url, 5);
   if (size <= 0) {
     addError(ERR_VERSION_FILE_SIZE);
+    sendAT("AT+HTTPTERM", TO_CELL);
     return -1;
   }
-  
-  while (tries < 3){
-    // FIX: Dynamically read the entire file size (9 bytes) instead of just 1 byte!
+
+  int tries = 0;
+  while (tries < 3) {
+    // Read the whole buffered body. size is the datalen from the final 200.
     String response = sendAT("AT+HTTPREAD=0," + String(size), TO_CELL);
-    
+
     int index = response.indexOf("+HTTPREAD:");
-    if (index == -1){
+    if (index == -1) {
       addError(ERR_VERSION_FILE_READ);
       tries++;
       delay(200);
@@ -263,7 +357,7 @@ int checkVersion() {
     }
 
     int startIndex = response.indexOf("\n", index);
-    if (startIndex == -1){
+    if (startIndex == -1) {
       addError(ERR_VERSION_FILE_READ);
       tries++;
       delay(200);
@@ -271,33 +365,37 @@ int checkVersion() {
     }
     startIndex++;
 
-    // Isolate the text payload data block safely
     String payload = response.substring(startIndex);
     if (payload.endsWith("OK")) {
       payload = payload.substring(0, payload.lastIndexOf("OK"));
     }
     payload.trim();
 
-    // Split the multi-line payload text cleanly by its newline delimiter
     int newlineIdx = payload.indexOf("\n");
     if (newlineIdx != -1) {
       String verStr = payload.substring(0, newlineIdx);
       String sizeStr = payload.substring(newlineIdx + 1);
       verStr.trim();
       sizeStr.trim();
-      
+
       serverVersion = verStr.toInt();
-      firmwareSize = sizeStr.toInt(); // Assigns 306384 globally!
-      
-      Serial.printf("\n[SUCCESS] Parsed metadata -> Version: %d | Size: %ld bytes\n", serverVersion, firmwareSize);
+      firmwareSize = sizeStr.toInt();
+
+      Serial.printf("\n[SUCCESS] Parsed metadata -> Version: %d | Size: %ld bytes\n",
+                    serverVersion, firmwareSize);
+      sendAT("AT+HTTPTERM", TO_CELL);   // close cleanly before the download session
+      delay(300);
       return serverVersion;
     } else {
-      // Fallback contingency layout
       serverVersion = payload.toInt();
-      firmwareSize = 306384; 
+      firmwareSize = 306384;
+      sendAT("AT+HTTPTERM", TO_CELL);
+      delay(300);
       return serverVersion;
     }
   }
+
+  sendAT("AT+HTTPTERM", TO_CELL);
   return -1;
 }
 
@@ -315,61 +413,24 @@ void downloadNewVersion() {
 
   Serial.printf("Initializing download of %d bytes...\n", firmwareSize);
 
-  // Single HTTP session, single GET. Let the modem buffer the whole file.
-  // Reset the modem's IP/HTTP stack to clear any wedged session state.
   sendAT("AT+HTTPTERM", TO_CELL);
-  delay(1000);
+  delay(100);
   sendAT("AT+HTTPINIT", TO_CELL);
   delay(100);
   sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL);
   sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);
   sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);
   sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL);
-  sendAT("AT+HTTPPARA=\"URL\",\"" + firmware_url + "\"", TO_CELL);
 
-  // Fire the GET and wait for the action notification with the total size.
-  Serial2.println("AT+HTTPACTION=0");
-  String actionResponse = "";
-  unsigned long actionStart = millis();
-  while (millis() - actionStart < 30000) {
-    if (Serial2.available() > 0) {
-      char c = Serial2.read();
-      actionResponse += c;
-      if (actionResponse.indexOf("+HTTPACTION:") != -1 && actionResponse.endsWith("\n")) break;
-    }
-    yield();
-  }
-  Serial.println("FULL ACTION RESP: [" + actionResponse + "]");
-  String body = sendAT("AT+HTTPREAD=0,512", TO_CELL);
-  Serial.println("BODY: [" + body + "]");
-
-  int actionIdx = actionResponse.indexOf("+HTTPACTION:");
-  long totalAvailable = 0;
-  if (actionIdx != -1) {
-    int firstComma = actionResponse.indexOf(",", actionIdx);
-    int secondComma = actionResponse.indexOf(",", firstComma + 1);
-    String status = actionResponse.substring(firstComma + 1, secondComma);
-    status.trim();
-    if (status != "200") {
-      Serial.printf("HTTP GET failed. Status: %s\n", status.c_str());
-      Update.abort();
-      sendAT("AT+HTTPTERM", TO_CELL);
-      return;
-    }
-    String sizeStr = actionResponse.substring(secondComma + 1);
-    sizeStr.trim();
-    totalAvailable = sizeStr.toInt();
-  } else {
-    Serial.println("No HTTPACTION response. Aborting.");
+  long totalAvailable = httpGetFollowingRedirects(firmware_url, 5);
+  if (totalAvailable <= 0) {
+    Serial.println("Download GET (with redirects) failed.");
     Update.abort();
     sendAT("AT+HTTPTERM", TO_CELL);
     return;
   }
-
   if (totalAvailable != firmwareSize) {
-    Serial.printf("WARNING: server file size %ld != expected %d\n", totalAvailable, firmwareSize);
-    // Trust the server's actual size for reading, but Update.begin used firmwareSize.
-    // If these differ, abort rather than write a truncated/oversized image.
+    Serial.printf("WARNING: server size %ld != expected %d\n", totalAvailable, firmwareSize);
     Update.abort();
     sendAT("AT+HTTPTERM", TO_CELL);
     return;
