@@ -51,7 +51,7 @@ const String oldLocHost = "dev.botech.com.co";
 const String oldLocPort = "9504";
 const String DEVICE_ID = "189";
 unsigned long ACTIVE_GPS_INTERVAL = 10; // active mode tracking interval in seconds
-unsigned long IDLE_GPS_INTERVAL = 15*60; // idle mode tracking interval
+unsigned long IDLE_GPS_INTERVAL = 30*60; // idle mode tracking interval
 const int NMEA_MAX_LENGTH = 82;
 const int PACKAGE_SIZE = 100;
 
@@ -130,7 +130,7 @@ void setup() {
   delay(1000);
   setupGPS();
   setupPDP();
-  sendAT("AT+CSIMSLEEP=1", TO_LOCAL);
+  sendAT("AT+CSIMSLEEP=0", TO_LOCAL);
   fixLocation();
   startSocket();
 
@@ -138,10 +138,11 @@ void setup() {
 }
 
 void loop() {
-  if (INA219_getCurrent_mA() > 0){
+  if (isActive()){
     if(millis() - lastUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
+      sendAT("AT+CGNSSWAKEUP", TO_LOCAL);
       lastUpdate = millis();
-      checkPowerStatus();
+      Serial.println(INA219_getCurrent_mA()/1000.0);
       if (getGPS()){
         startSocket(); 
         
@@ -178,6 +179,8 @@ void loop() {
       }
     }
   } else {
+    Serial.println("hello");
+    checkPowerStatus();
     unsigned long sinceLastWakeup = millis() - lastUpdate;
     lastUpdate = millis();    
     uint64_t sleepMs = IDLE_GPS_INTERVAL * 1000;
@@ -187,7 +190,8 @@ void loop() {
       sleepMs = 1000;
     }
     uint64_t interval = sleepMs * 1000ULL;
-    sendAT("AT+CGNSSWAKEUP", TO_LOCAL);
+    sendAT("AT+CGPSHOT", TO_LOCAL);
+    fixLocation();
     if (getGPS()){
       startSocket();
       String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
@@ -206,7 +210,6 @@ void loop() {
       count++;
     }
     if (!failed){
-      sendAT("AT+CGNSSSLEEP", TO_LOCAL);
       Serial.flush();
       esp_light_sleep_start(); 
     }
@@ -875,4 +878,8 @@ void checkPowerStatus() {
   Serial.print(p, 1);
   Serial.println("%");
 
+}
+
+bool isActive(){
+  return INA219_getCurrent_mA() < -15.0;
 }
