@@ -1,5 +1,6 @@
 #include  <Arduino.h>
 #include <Update.h>
+#include <Preferences.h>
 
 //define physical pins
 #define RX2 16
@@ -37,13 +38,10 @@ const String APN = "fast.t-mobile.com";
 const String HOST = "www.botech.com.co";
 const String PORT = "9504";
 const String PATH = "/";
-const String DEVICE_ID = "189";
+String DEVICE_ID = "000";
 
 //CHANGE THIS EVERY UPDATE!!
 const int LOCAL_VERSION = 0;
-// Global parameters updated dynamically by checkVersion()
-int serverVersion = 0;
-long firmwareSize = 0; 
 
 // Your exact Dropbox asset links (configured to force direct raw downloads)
 String version_url = "https://dl.dropboxusercontent.com/scl/fi/r0rhfi73h7iciwrlumrls/version.txt?rlkey=ddjovrejh5wg06vr26z63uvmu&st=9zyuv7eo&dl=1";
@@ -74,7 +72,7 @@ String nmeaSentence;
 char nmeaArray[NMEA_MAX_LENGTH][GPS_DATA_ARRAY_SIZE];
 int nmeaIndex = 0;
 bool otaExecutedToday = false; // Prevents re-trigger loop
-String dateLastUpdated = "000000"; // ddmmyy
+String dateLastUpdated = "000000"; // ddmmyy, change this when you update
 int serverVersion = 0;
 int firmwareSize = 0; // Will be parsed dynamically from version.txt
 
@@ -104,7 +102,27 @@ void setup() {
   Serial.begin(115200);
   Serial2.begin(115200, SERIAL_8N1, RX2, TX2);
   delay(1000);
-    
+
+  // // Open namespace "storage" in Read/Write mode (false)
+  // preferences.begin("storage", false);
+
+  // // Try to read the key "dev_id". If it doesn't exist, fall back to "189", or whatever
+  // // device ID you need
+  // DEVICE_ID = preferences.getString("dev_id", "189");
+  
+  // // If it was empty/new, save it explicitly so it's permanently there
+  // if (DEVICE_ID == "189" && !preferences.isKey("dev_id")) {
+  //   preferences.putString("dev_id", "189");
+  // }
+  
+  // Serial.print("\n[SYSTEM] Persistent Hardware Device ID Loaded: ");
+  // Serial.println(DEVICE_ID);
+  
+  // // Close the preferences instance until needed again
+  // preferences.end();
+
+  delay(1000);
+
   Serial2.println("AT");
   delay(500);
 
@@ -137,7 +155,7 @@ String getDate() {
       return gpsFields[9].substring(0, 2);
     }
   }
-  return "00"; // Fallback
+  return "00";
 }
 
 void loop() {
@@ -159,8 +177,7 @@ void loop() {
     Serial.println("lastUpdate:"+dateLastUpdated);
     Serial.println("curDate:"+curDate);
     if (dateLastUpdated != curDate) {
-       
-      doOTA();
+      downloadNewVersion();
     }
   }
 }
@@ -262,56 +279,32 @@ int checkVersion() {
   int tries = 0;
   while (tries < 3) {
     // 2. Command the modem to pull down the ENTIRE metadata block payload safely
-    String response = sendAT("AT+HTTPREAD=0," + String(metadataFileSize), TO_CELL);
-    
-    int index = response.indexOf("+HTTPREAD:");
-    if (index == -1) {
-      addError(ERR_VERSION_FILE_READ);
-      tries++;
-      delay(200);
-      continue;
-    }
-
-    int startIndex = response.indexOf("\n", index);
-    if (startIndex == -1) {
-      addError(ERR_VERSION_FILE_READ);
-      tries++;
-      delay(200);
-      continue;
-    }
-    startIndex++;
-
-    // 3. Isolate the raw multi-line payload string
-    String payload = response.substring(startIndex);
-    if (payload.endsWith("OK")) {
-      payload = payload.substring(0, payload.lastIndexOf("OK"));
-    }
-    payload.trim();
+    String response = sendATHTTPREAD(String(metadataFileSize), TO_CELL);
+    Serial.println("READRESPONSE"+response);
 
     // 4. Split the text payload cleanly by its newline delimiter
-    int newlineIdx = payload.indexOf("\n");
+    int newlineIdx = response.indexOf("\n");
     if (newlineIdx != -1) {
-      String verStr = payload.substring(0, newlineIdx);
-      String sizeStr = payload.substring(newlineIdx + 1);
+      String verStr = response.substring(0, newlineIdx);
+      String sizeStr = response.substring(newlineIdx + 1);
       verStr.trim();
       sizeStr.trim();
       
       serverVersion = verStr.toInt();
-      firmwareSize = sizeStr.toLong(); // Set the size constraint globally!
+      firmwareSize = sizeStr.toInt();
       
       Serial.printf("[SUCCESS] Metadata Sync -> Target Version: %d | Expected Size: %ld bytes\n", serverVersion, firmwareSize);
       return serverVersion;
     } else {
-      // Emergency single-line fallback safety context
-      serverVersion = payload.toInt();
-      firmwareSize = 306384; // Backup fallback
-      return serverVersion;
+      Serial.println("[ERROR] Failed to parse version information.");
+      stop();
     }
   }
   return -1;
 }
 
 void downloadNewVersion() {
+  checkVersion();
   if (firmwareSize <= 0) {
     Serial.println("Error: Valid firmware size not found. Aborting.");
     return;
@@ -324,7 +317,7 @@ void downloadNewVersion() {
 
   Serial.printf("Initializing Zero-Drift Stream Parser for %ld bytes...\n", firmwareSize);
   long currentPosition = 0;
-  const int chunkSize = 10240; 
+  const int chunkSize = 1024; 
   bool downloadComplete = false;
 
   while (currentPosition < firmwareSize && !downloadComplete) {
@@ -343,6 +336,7 @@ void downloadNewVersion() {
     if (endPosition >= firmwareSize) {
       endPosition = firmwareSize - 1;
     }
+    long targetBytesThisChunk = (endPosition - currentPosition) + 1;
     
     String rangeHeader = "Range: bytes=" + String(currentPosition) + "-" + String(endPosition);
     sendAT("AT+HTTPPARA=\"USERDATA\",\"" + rangeHeader + "\"", TO_CELL);
@@ -352,13 +346,14 @@ void downloadNewVersion() {
     String actionResponse = "";
     unsigned long actionStart = millis();
     int receivedBytes = 0;
-
-    while (millis() - actionStart < 20000) { // Increased to 20 seconds for cellular stabilization
-      if (Serial2.available() > 0) {
+    while (millis() - actionStart < 20000) {
+      while (Serial2.available() > 0) {
         char c = Serial2.read();
+        Serial.write(c);
         actionResponse += c;
         if (actionResponse.indexOf("+HTTPACTION:") != -1 && actionResponse.endsWith("\n")) break;
       }
+      if (actionResponse.indexOf("+HTTPACTION:") != -1) break;
       yield();
     }
 
@@ -368,7 +363,7 @@ void downloadNewVersion() {
       int secondComma = actionResponse.indexOf(",", firstComma + 1);
       String status = actionResponse.substring(firstComma + 1, secondComma);
       status.trim();
-      
+
       if (status == "200" || status == "206") {
         String sizeStr = actionResponse.substring(secondComma + 1);
         sizeStr.trim();
@@ -378,6 +373,10 @@ void downloadNewVersion() {
         Update.abort();
         return;
       }
+    } else {
+      Serial.println("No HTTPACTION response received.");
+      Update.abort();
+      return;
     }
 
     if (receivedBytes <= 0) {
@@ -385,63 +384,30 @@ void downloadNewVersion() {
       break;
     }
 
-    // Clear any residual network echoes BEFORE reading
-    while (Serial2.available() > 0) { Serial2.read(); }
-
-    Serial2.println("AT+HTTPREAD=0," + String(receivedBytes));
-    
-    unsigned long readTimeout = millis();
-    bool headerSkipped = false;
-    String headerBuffer = "";
-
-    while (millis() - readTimeout < 5000) {
-      if (Serial2.available() > 0) {
-        char c = Serial2.read();
-        headerBuffer += c;
-        if (headerBuffer.indexOf("+HTTPREAD:") != -1 && c == '\n') {
-          headerSkipped = true;
-          break;
-        }
-      }
-      yield();
-    }
-
-    if (!headerSkipped) {
-      Serial.println("Error: Failed to synchronize with HTTPREAD header context.");
+    // Use sendATHTTPREAD to fetch the payload
+    String payload = sendATHTTPREAD(String(targetBytesThisChunk), TO_CELL);
+    if (payload.length() == 0) {
+      Serial.println("Error: HTTPREAD returned no data.");
       Update.abort();
       return;
     }
 
-    // Let data pool cleanly in the expanded hardware buffer
-    delay(30); 
-
-    int bytesWrittenIntoFlash = 0;
-    
-    int bytesToReadThisChunk = receivedBytes;
-    if (currentPosition + bytesToReadThisChunk > firmwareSize) {
-      bytesToReadThisChunk = firmwareSize - currentPosition;
+    // If module returned fewer bytes than requested, accept actual length
+    int bytesToWrite = payload.length();
+    if (bytesToWrite > (firmwareSize - currentPosition)) {
+      bytesToWrite = firmwareSize - currentPosition;
     }
 
-    // HIGH-PATIENCE READ LOOP: We wait up to 10 seconds per sluggish block segment
-    readTimeout = millis();
-    while (bytesWrittenIntoFlash < bytesToReadThisChunk) {
-      if (Serial2.available() > 0) {
-        uint8_t b = Serial2.read();
-        Update.write(&b, 1); 
-        bytesWrittenIntoFlash++;
-        currentPosition++;
-        readTimeout = millis(); // Reset timeout ONLY when a real byte is extracted
-      }
-      
-      if (millis() - readTimeout > 10000) { // 10-second stall safety
-        Serial.printf("\nCRITICAL: Hardware stream stalled mid-chunk! Missing %d bytes.\n", (bytesToReadThisChunk - bytesWrittenIntoFlash));
-        Update.abort();
-        return;
-      }
-      yield();
+    // Write payload into flash (safely, byte-by-byte)
+    int bytesWritten = 0;
+    for (int i = 0; i < bytesToWrite; i++) {
+      uint8_t b = (uint8_t)payload.charAt(i);
+      Update.write(&b, 1);
+      bytesWritten++;
+      currentPosition++;
     }
 
-    Serial.printf("Verified Download Progress: %.2f%% (%ld / %ld bytes flashed)\n", 
+    Serial.printf("Verified Download Progress: %.2f%% (%ld / %ld bytes flashed)\n",
                   ((float)currentPosition / firmwareSize) * 100, currentPosition, firmwareSize);
     
     if (currentPosition >= firmwareSize) {
@@ -449,12 +415,12 @@ void downloadNewVersion() {
     }
   }
 
-  // Final check and signature validation execution
+  // Finalize update
   if (Update.end() && Update.isFinished()) {
     Serial.println("\n[SUCCESS] Binary matches signature constraints! Rebooting...");
     sendAT("AT+HTTPTERM", TO_CELL);
     delay(500);
-    ESP.restart(); 
+    ESP.restart();
   } else {
     Serial.printf("\n[FAILURE] Update verification failed. Core reason: %s\n", Update.errorString());
     sendAT("AT+HTTPTERM", TO_CELL);
@@ -710,8 +676,11 @@ bool ATCIPOPEN(){
 // Read the response for an AT+HTTPREAD command from Serial2 and return the raw data payload.
 // Returns an empty string on timeout or error.
 String sendATHTTPREAD(String numBytesToRead, unsigned long timeout) {
+  while (Serial2.available() > 0) {
+      Serial.write(Serial2.read());
+  }
   // send the AT message
-  Serial2.print("AT+HTTPREAD=0,"+numBytesToRead);
+  Serial2.println("AT+HTTPREAD=0,"+numBytesToRead);
   
   // read the response
   unsigned long start = millis();
