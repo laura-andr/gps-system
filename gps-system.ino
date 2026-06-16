@@ -41,8 +41,13 @@ const String DEVICE_ID = "189";
 
 //CHANGE THIS EVERY UPDATE!!
 const int LOCAL_VERSION = 0;
-const String version_url = "https://github.com/laura-andr/gps-system/releases/latest/download/version.txt";
-const String firmware_url = "https://github.com/laura-andr/gps-system/releases/latest/download/test-gps-code.ino.bin";
+// Global parameters updated dynamically by checkVersion()
+int serverVersion = 0;
+long firmwareSize = 0; 
+
+// Your exact Dropbox asset links (configured to force direct raw downloads)
+String version_url = "https://dl.dropboxusercontent.com/scl/fi/r0rhfi73h7iciwrlumrls/version.txt?rlkey=ddjovrejh5wg06vr26z63uvmu&st=9zyuv7eo&dl=1";
+String firmware_url = "https://dl.dropboxusercontent.com/scl/fi/1x22iaxccj0rqc2e2tuvf/test-gps-code.ino.bin?rlkey=eh8112jyw16821s8k884o9d76&st=u3ulhjbe&dl=1";
 
 
 const int GPS_INTERVAL = 10; // tracking interval in seconds
@@ -160,93 +165,6 @@ void loop() {
   }
 }
 
-// Reads the Location header from the last HTTP response after a 3xx.
-String getRedirectLocation() {
-  String resp = sendAT("AT+HTTPHEAD", TO_CELL);
-  // Find "Location:" (case-insensitive-ish; GitHub uses "Location:")
-  int locIdx = resp.indexOf("Location:");
-  if (locIdx == -1) locIdx = resp.indexOf("location:");
-  if (locIdx == -1) return "";
-
-  int start = locIdx + 9; // past "Location:"
-  // skip spaces
-  while (start < resp.length() && resp.charAt(start) == ' ') start++;
-  int end = resp.indexOf("\r", start);
-  if (end == -1) end = resp.indexOf("\n", start);
-  if (end == -1) end = resp.length();
-
-  String loc = resp.substring(start, end);
-  loc.trim();
-  return loc;
-}
-
-// Fires HTTPACTION for the current URL, returns the status code via reference,
-// and the datalen as the function return. Sets actionRespOut for logging.
-int doHttpActionGet(long &dataLenOut, String &actionRespOut) {
-  Serial2.println("AT+HTTPACTION=0");
-  String actionResponse = "";
-  unsigned long actionStart = millis();
-  while (millis() - actionStart < 30000) {
-    if (Serial2.available() > 0) {
-      char c = Serial2.read();
-      actionResponse += c;
-      if (actionResponse.indexOf("+HTTPACTION:") != -1 && actionResponse.endsWith("\n")) break;
-    }
-    yield();
-  }
-  actionRespOut = actionResponse;
-
-  int actionIdx = actionResponse.indexOf("+HTTPACTION:");
-  if (actionIdx == -1) { dataLenOut = 0; return -1; }
-  int firstComma = actionResponse.indexOf(",", actionIdx);
-  int secondComma = actionResponse.indexOf(",", firstComma + 1);
-  int status = actionResponse.substring(firstComma + 1, secondComma).toInt();
-  String sizeStr = actionResponse.substring(secondComma + 1);
-  sizeStr.trim();
-  dataLenOut = sizeStr.toInt();
-  return status;
-}
-
-// Sets the URL param, fires the GET, and follows up to maxRedirects 3xx hops.
-// On success leaves the session open with the body buffered, returns datalen.
-// Returns -1 on failure.
-long httpGetFollowingRedirects(String url, int maxRedirects) {
-  for (int hop = 0; hop <= maxRedirects; hop++) {
-    if (!sendATincludes("AT+HTTPPARA=\"URL\",\"" + url + "\"", "OK", TO_CELL)) {
-      Serial.println("Failed to set URL param.");
-      return -1;
-    }
-
-    long dataLen = 0;
-    String actionResp = "";
-    int status = doHttpActionGet(dataLen, actionResp);
-    Serial.println("FULL ACTION RESP: [" + actionResp + "]");
-    Serial.printf("Hop %d -> status %d, datalen %ld\n", hop, status, dataLen);
-
-    if (status == 200) {
-      return dataLen;  // success; body is buffered, ready for HTTPREAD
-    }
-
-    if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
-      String next = getRedirectLocation();
-      if (next.length() == 0) {
-        Serial.println("Got redirect but no Location header. Aborting.");
-        return -1;
-      }
-      Serial.println("Redirecting to: " + next);
-      url = next;
-      // loop again with the new URL
-      continue;
-    }
-
-    // Any other status (incl. 707) is a failure for this hop
-    Serial.printf("Unexpected status %d. Aborting.\n", status);
-    return -1;
-  }
-  Serial.println("Exceeded max redirects. Aborting.");
-  return -1;
-}
-
 long httpGET(String url) {
   int tries = 0;
 
@@ -263,9 +181,13 @@ long httpGET(String url) {
       continue;
     } 
 
-    sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); // Target TLS 1.2
-    sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   // Ignore certificate validation chains
-    sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);
+    // 3. Configure internal SSL Engine for Dropbox (Context 0)
+    sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); // Force TLS 1.2 explicitly
+    sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   // Bypass strict certificate authority checks
+    sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);  // Enable Server Name Indication
+    
+    // NEW CRITICAL LINE FOR DROPBOX SECURE HANDSHAKES:
+    sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL); // Enable ALL cipher suites supported by the modem
     
     // 4. Bind the target URL string
     if (!sendATincludes("AT+HTTPPARA=\"URL\",\"" + url + "\"", "OK", TO_CELL)){
@@ -327,27 +249,21 @@ long httpGET(String url) {
 }
 
 int checkVersion() {
-  // Open a fresh HTTP/SSL session for the version fetch.
-  sendAT("AT+HTTPTERM", TO_CELL);
-  delay(100);
-  sendAT("AT+HTTPINIT", TO_CELL);
-  delay(100);
-  sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); // Target TLS 1.2
-  sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   // Ignore certificate validation chains
-  sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);
-
-  long size = httpGetFollowingRedirects(version_url, 5);
-  if (size <= 0) {
+  Serial.println("\nChecking for available firmware updates...");
+  
+  // 1. Fetch the exact metadata file size dynamically
+  long metadataFileSize = httpGET(version_url); 
+  if (metadataFileSize <= 0) {
     addError(ERR_VERSION_FILE_SIZE);
-    sendAT("AT+HTTPTERM", TO_CELL);
+    Serial.println("[ERROR] Failed to obtain valid version.txt size from server.");
     return -1;
   }
-
+  
   int tries = 0;
   while (tries < 3) {
-    // Read the whole buffered body. size is the datalen from the final 200.
-    String response = sendAT("AT+HTTPREAD=0," + String(size), TO_CELL);
-
+    // 2. Command the modem to pull down the ENTIRE metadata block payload safely
+    String response = sendAT("AT+HTTPREAD=0," + String(metadataFileSize), TO_CELL);
+    
     int index = response.indexOf("+HTTPREAD:");
     if (index == -1) {
       addError(ERR_VERSION_FILE_READ);
@@ -365,209 +281,184 @@ int checkVersion() {
     }
     startIndex++;
 
+    // 3. Isolate the raw multi-line payload string
     String payload = response.substring(startIndex);
     if (payload.endsWith("OK")) {
       payload = payload.substring(0, payload.lastIndexOf("OK"));
     }
     payload.trim();
 
+    // 4. Split the text payload cleanly by its newline delimiter
     int newlineIdx = payload.indexOf("\n");
     if (newlineIdx != -1) {
       String verStr = payload.substring(0, newlineIdx);
       String sizeStr = payload.substring(newlineIdx + 1);
       verStr.trim();
       sizeStr.trim();
-
+      
       serverVersion = verStr.toInt();
-      firmwareSize = sizeStr.toInt();
-
-      Serial.printf("\n[SUCCESS] Parsed metadata -> Version: %d | Size: %ld bytes\n",
-                    serverVersion, firmwareSize);
-      sendAT("AT+HTTPTERM", TO_CELL);   // close cleanly before the download session
-      delay(300);
+      firmwareSize = sizeStr.toLong(); // Set the size constraint globally!
+      
+      Serial.printf("[SUCCESS] Metadata Sync -> Target Version: %d | Expected Size: %ld bytes\n", serverVersion, firmwareSize);
       return serverVersion;
     } else {
+      // Emergency single-line fallback safety context
       serverVersion = payload.toInt();
-      firmwareSize = 306384;
-      sendAT("AT+HTTPTERM", TO_CELL);
-      delay(300);
+      firmwareSize = 306384; // Backup fallback
       return serverVersion;
     }
   }
-
-  sendAT("AT+HTTPTERM", TO_CELL);
   return -1;
 }
 
 void downloadNewVersion() {
-  Serial.println(sendAT("AT+CSQ", TO_LOCAL));
   if (firmwareSize <= 0) {
     Serial.println("Error: Valid firmware size not found. Aborting.");
     return;
   }
 
   if (!Update.begin(firmwareSize)) {
-    Serial.printf("CRITICAL ERROR: File size (%d bytes) exceeds available space!\n", firmwareSize);
+    Serial.printf("CRITICAL ERROR: File size (%ld bytes) exceeds available space!\n", firmwareSize);
     return;
   }
 
-  Serial.printf("Initializing download of %d bytes...\n", firmwareSize);
-
-  sendAT("AT+HTTPTERM", TO_CELL);
-  delay(100);
-  sendAT("AT+HTTPINIT", TO_CELL);
-  delay(100);
-  sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL);
-  sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);
-  sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);
-  sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL);
-
-  long totalAvailable = httpGetFollowingRedirects(firmware_url, 5);
-  if (totalAvailable <= 0) {
-    Serial.println("Download GET (with redirects) failed.");
-    Update.abort();
-    sendAT("AT+HTTPTERM", TO_CELL);
-    return;
-  }
-  if (totalAvailable != firmwareSize) {
-    Serial.printf("WARNING: server size %ld != expected %d\n", totalAvailable, firmwareSize);
-    Update.abort();
-    sendAT("AT+HTTPTERM", TO_CELL);
-    return;
-  }
-
+  Serial.printf("Initializing Zero-Drift Stream Parser for %ld bytes...\n", firmwareSize);
   long currentPosition = 0;
+  const int chunkSize = 10240; 
+  bool downloadComplete = false;
 
-  while (currentPosition < firmwareSize) {
-    long remaining = firmwareSize - currentPosition;
-    // Ask for a generous window; the modem will cap each read at its own
-    // internal limit (1024 on this firmware) and tell us the real count.
-    int requestLen = (remaining > 1024) ? 1024 : (int)remaining;
+  while (currentPosition < firmwareSize && !downloadComplete) {
+    sendAT("AT+HTTPTERM", TO_CELL);
+    delay(100);
+    sendAT("AT+HTTPINIT", TO_CELL);
+    delay(100);
 
-    // Drain anything stale before issuing the read.
-    while (Serial2.available() > 0) Serial2.read();
+    sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); 
+    sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   
+    sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);  
+    sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL);
+    sendAT("AT+HTTPPARA=\"URL\",\"" + firmware_url + "\"", TO_CELL);
 
-    Serial2.println("AT+HTTPREAD=0," + String(requestLen));
+    long endPosition = currentPosition + chunkSize - 1;
+    if (endPosition >= firmwareSize) {
+      endPosition = firmwareSize - 1;
+    }
+    
+    String rangeHeader = "Range: bytes=" + String(currentPosition) + "-" + String(endPosition);
+    sendAT("AT+HTTPPARA=\"USERDATA\",\"" + rangeHeader + "\"", TO_CELL);
 
-    // Parse the "+HTTPREAD: <len>" data header to learn the actual count.
+    Serial2.println("AT+HTTPACTION=0");
+    
+    String actionResponse = "";
+    unsigned long actionStart = millis();
+    int receivedBytes = 0;
+
+    while (millis() - actionStart < 20000) { // Increased to 20 seconds for cellular stabilization
+      if (Serial2.available() > 0) {
+        char c = Serial2.read();
+        actionResponse += c;
+        if (actionResponse.indexOf("+HTTPACTION:") != -1 && actionResponse.endsWith("\n")) break;
+      }
+      yield();
+    }
+
+    int actionIdx = actionResponse.indexOf("+HTTPACTION:");
+    if (actionIdx != -1) {
+      int firstComma = actionResponse.indexOf(",", actionIdx);
+      int secondComma = actionResponse.indexOf(",", firstComma + 1);
+      String status = actionResponse.substring(firstComma + 1, secondComma);
+      status.trim();
+      
+      if (status == "200" || status == "206") {
+        String sizeStr = actionResponse.substring(secondComma + 1);
+        sizeStr.trim();
+        receivedBytes = sizeStr.toInt();
+      } else {
+        Serial.printf("\nNetwork error at position %ld. Status: %s\n", currentPosition, status.c_str());
+        Update.abort();
+        return;
+      }
+    }
+
+    if (receivedBytes <= 0) {
+      downloadComplete = true;
+      break;
+    }
+
+    // Clear any residual network echoes BEFORE reading
+    while (Serial2.available() > 0) { Serial2.read(); }
+
+    Serial2.println("AT+HTTPREAD=0," + String(receivedBytes));
+    
+    unsigned long readTimeout = millis();
+    bool headerSkipped = false;
     String headerBuffer = "";
-    unsigned long headerTimeout = millis();
-    int reportedLen = -1;
-    bool gotHeader = false;
 
-    while (millis() - headerTimeout < 5000) {
+    while (millis() - readTimeout < 5000) {
       if (Serial2.available() > 0) {
         char c = Serial2.read();
         headerBuffer += c;
-        int hrIdx = headerBuffer.indexOf("+HTTPREAD:");
-        if (hrIdx != -1 && c == '\n') {
-          int colon = headerBuffer.indexOf(":", hrIdx);
-          String lenStr = headerBuffer.substring(colon + 1);
-          lenStr.trim();
-          int rl = lenStr.toInt();
-          // Skip the trailing "+HTTPREAD: 0" terminator line if it shows up
-          // as the header; only accept a positive data length here.
-          if (rl > 0) {
-            reportedLen = rl;
-            gotHeader = true;
-            break;
-          }
+        if (headerBuffer.indexOf("+HTTPREAD:") != -1 && c == '\n') {
+          headerSkipped = true;
+          break;
         }
       }
       yield();
     }
 
-    if (!gotHeader || reportedLen <= 0) {
-      Serial.printf("Failed to get HTTPREAD data header at %ld. Aborting.\n", currentPosition);
+    if (!headerSkipped) {
+      Serial.println("Error: Failed to synchronize with HTTPREAD header context.");
       Update.abort();
-      sendAT("AT+HTTPTERM", TO_CELL);
       return;
     }
 
-    // Read exactly reportedLen bytes — whatever the modem actually gives.
-    uint8_t* buf = (uint8_t*)malloc(reportedLen);
-    if (buf == nullptr) {
-      Serial.println("malloc failed. Aborting.");
-      Update.abort();
-      sendAT("AT+HTTPTERM", TO_CELL);
-      return;
+    // Let data pool cleanly in the expanded hardware buffer
+    delay(30); 
+
+    int bytesWrittenIntoFlash = 0;
+    
+    int bytesToReadThisChunk = receivedBytes;
+    if (currentPosition + bytesToReadThisChunk > firmwareSize) {
+      bytesToReadThisChunk = firmwareSize - currentPosition;
     }
 
-    int bytesRead = 0;
-    unsigned long readDeadline = millis() + 10000;
-    while (bytesRead < reportedLen && millis() < readDeadline) {
+    // HIGH-PATIENCE READ LOOP: We wait up to 10 seconds per sluggish block segment
+    readTimeout = millis();
+    while (bytesWrittenIntoFlash < bytesToReadThisChunk) {
       if (Serial2.available() > 0) {
-        buf[bytesRead++] = Serial2.read();
+        uint8_t b = Serial2.read();
+        Update.write(&b, 1); 
+        bytesWrittenIntoFlash++;
+        currentPosition++;
+        readTimeout = millis(); // Reset timeout ONLY when a real byte is extracted
+      }
+      
+      if (millis() - readTimeout > 10000) { // 10-second stall safety
+        Serial.printf("\nCRITICAL: Hardware stream stalled mid-chunk! Missing %d bytes.\n", (bytesToReadThisChunk - bytesWrittenIntoFlash));
+        Update.abort();
+        return;
       }
       yield();
     }
 
-    if (bytesRead != reportedLen) {
-      Serial.printf("Short read: got %d of %d at %ld. Aborting.\n",
-                    bytesRead, reportedLen, currentPosition);
-      free(buf);
-      Update.abort();
-      sendAT("AT+HTTPTERM", TO_CELL);
-      return;
-    }
-
-    size_t written = Update.write(buf, reportedLen);
-    free(buf);
-
-    if (written != (size_t)reportedLen) {
-      Serial.printf("Update.write wrote %d of %d. Aborting.\n", (int)written, reportedLen);
-      Update.abort();
-      sendAT("AT+HTTPTERM", TO_CELL);
-      return;
-    }
-
-    currentPosition += reportedLen;
-
-    // Consume the trailing OK after the data block.
-    unsigned long okTimeout = millis();
-    String tail = "";
-    while (millis() - okTimeout < 2000) {
-      if (Serial2.available()) {
-        char c = Serial2.read();
-        tail += c;
-        if (tail.indexOf("OK") != -1) break;
-      }
-      yield();
-    }
-
-    if (currentPosition % 20480 < 1024) {
-      Serial.printf("Progress: %.1f%% (%ld / %d)\n",
-                    ((float)currentPosition / firmwareSize) * 100, currentPosition, firmwareSize);
+    Serial.printf("Verified Download Progress: %.2f%% (%ld / %ld bytes flashed)\n", 
+                  ((float)currentPosition / firmwareSize) * 100, currentPosition, firmwareSize);
+    
+    if (currentPosition >= firmwareSize) {
+      downloadComplete = true;
     }
   }
 
-  Serial.printf("Final position: %ld / %d\n", currentPosition, firmwareSize);
-
+  // Final check and signature validation execution
   if (Update.end() && Update.isFinished()) {
-    Serial.println("\n[SUCCESS] Firmware verified! Rebooting...");
+    Serial.println("\n[SUCCESS] Binary matches signature constraints! Rebooting...");
     sendAT("AT+HTTPTERM", TO_CELL);
     delay(500);
-    ESP.restart();
+    ESP.restart(); 
   } else {
-    Serial.printf("\n[FAILURE] Update halted. Error: %s\n", Update.errorString());
+    Serial.printf("\n[FAILURE] Update verification failed. Core reason: %s\n", Update.errorString());
     sendAT("AT+HTTPTERM", TO_CELL);
   }
-}
-
-void doOTA() {
-  int remoteVersion = checkVersion();
-  
-  if (remoteVersion <= 0) {
-    return;
-  }
-  
-  Serial.printf("Current Version: %d | Server Version: %d\n", LOCAL_VERSION, remoteVersion);
-  
-  if (remoteVersion > LOCAL_VERSION) {
-    downloadNewVersion();
-  }
-  
-  sendAT("AT+HTTPTERM", TO_CELL);
 }
 
 
@@ -814,6 +705,68 @@ bool ATCIPOPEN(){
   }
   addError(ERR_AT_FAILURE);
   return false;
+}
+
+// Read the response for an AT+HTTPREAD command from Serial2 and return the raw data payload.
+// Returns an empty string on timeout or error.
+String sendATHTTPREAD(String numBytesToRead, unsigned long timeout) {
+  // send the AT message
+  Serial2.print("AT+HTTPREAD=0,"+numBytesToRead);
+  
+  // read the response
+  unsigned long start = millis();
+  String curLine = "";
+  bool headerFound = false;
+  int dataLen = -1;
+  String payload = "";
+  int bytesCollected = 0;
+
+  while (millis() - start < timeout) {
+    while (Serial2.available() > 0) {
+      char c = Serial2.read();
+      Serial.write(c); // mirror for debug / logging
+
+      if (!headerFound) {
+        // Accumulate a line until newline to look for the +HTTPREAD: header or ERROR
+        if (c == '\n') {
+          curLine.trim();
+          if (curLine.length() > 0) {
+            if (curLine.indexOf("ERROR") != -1) {
+              return ""; // read failed
+            }
+            int idx = curLine.indexOf("+HTTPREAD:");
+            if (idx != -1) {
+              // parse length
+              String lenStr = curLine.substring(idx + 10);
+              lenStr.trim();
+              dataLen = lenStr.toInt();
+              headerFound = true;
+              // if there's no data to read, return empty payload
+              if (dataLen <= 0) return "";
+            }
+          }
+          curLine = "";
+        } else if (c != '\r') {
+          curLine += c;
+        }
+      } else {
+        // After header found, read exactly dataLen bytes (count raw bytes)
+        payload += c;
+        bytesCollected++;
+        if (bytesCollected >= dataLen) {
+          // Return exactly the data block (first dataLen bytes)
+          if (payload.length() > dataLen) {
+            return payload.substring(0, dataLen);
+          }
+          return payload;
+        }
+      }
+    }
+    yield();
+  }
+
+  // timeout
+  return "";
 }
 
 String sendAT(String msg, unsigned long timeout) {
