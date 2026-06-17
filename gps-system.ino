@@ -1,11 +1,23 @@
 //import libraries
 #include  <Arduino.h>
 #include <Update.h>
+#include <Wire.h>
 #include <Preferences.h>
 
 //define physical pins
 #define RX2 16
 #define TX2 17
+#define I2C_SDA 21 
+#define I2C_SCL 22 
+
+// INA219 Register Addresses
+#define INA219_ADDR           0x43 // Set matching Python code (addr=0x43)
+#define _REG_CONFIG           0x00
+#define _REG_SHUNTVOLTAGE     0x01
+#define _REG_BUSVOLTAGE       0x02
+#define _REG_POWER            0x03
+#define _REG_CURRENT          0x04
+#define _REG_CALIBRATION      0x05
 
 //Error Logs
 #define ERR_AT_TIMEOUT 100
@@ -29,8 +41,15 @@
 #define ERR_INSUFFICIENT_SPACE 505
 #define ERR_READ_UPDATE 506
 #define ERR_UPDATE_FAILURE 507
+#define ERR_LIGHTSLEEP 600
 
 // begin define constants 
+
+  // INA219 Driver Constants & Tracking Variable
+const uint16_t INA219_CAL_VALUE = 26868;
+const float INA219_CURRENT_LSB = 0.1524; // mA per bit
+const float INA219_POWER_LSB = 0.003048; // W per bit
+int lowVoltageCounter = 0;               // Replaces python 'low = 0'
 
   // network registration
 const String APN = "fast.t-mobile.com";
@@ -77,6 +96,7 @@ String DEVICE_ID = "000";
 
   // gps global variables
 unsigned long lastLocUpdate;
+unsigned long sinceLastWakeup;
 unsigned long gpsStartTime;
 String gpsData;
 String gpsFields[18];
@@ -97,13 +117,20 @@ void setup() {
   delay(3000);
   Serial.begin(115200);
   Serial2.begin(115200, SERIAL_8N1, RX2, TX2);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setTimeOut(50);
+  setupINA219();
+  
   delay(1000);
+  
   setupDeviceID();
+  
   delay(1000);
   sendAT("AT", TO_LOCAL);
   delay(1000);
   sendAT("AT+IPR=115200", TO_LOCAL);
   delay(1000);
+  
   setupGPS();
   setupPDP();
   fixLocation();
@@ -111,22 +138,62 @@ void setup() {
   setupSSL();
 
   lastLocUpdate = millis();
+  sinceLastWakeup = millis();
 }
-
 
 
 void loop() {
-  if (millis() - lastLocUpdate >= (GPS_INTERVAL * 1000)){
-    lastLocUpdate = millis();
+  if (isActive()){
+     if (millis() - lastLocUpdate >= (GPS_INTERVAL * 1000)){
+       checkPowerStatus();
+       lastLocUpdate = millis();
+       if (getGPS()){
+         startSocket(); 
+       }
+      }
+    if(millis() - lastLocUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
+      lastLocUpdate = millis();
+      if (getGPS()){
+        startSocket(); 
+        sendNmeaSentence();
+      }
+    }
+  } else {
+    checkPowerStatus();
+    checkAndDoOTA();
+    sinceLastWakeup = millis() - lastLocUpdate;
+    lastLocUpdate = millis();    
+    uint64_t sleepMs = IDLE_GPS_INTERVAL * 1000;
+    if (sleepMs > sinceLastWakeup) {
+      sleepMs -= sinceLastWakeup;
+    }
+    uint64_t interval = sleepMs * 1000ULL;
+    sendAT("AT+CGPSHOT", TO_LOCAL);
+    fixLocation();
     if (getGPS()){
-      startSocket(); 
+      startSocket();
       sendNmeaSentence();
     }
-    checkAndDoOTA();
-  }
-}
-// Helper functions (reorganized)
+    int count = 0;
+    bool failed = false;
+    while (ESP_OK != esp_sleep_enable_timer_wakeup(interval)){
+      if (count == 3){
+        addError(ERR_LIGHTSLEEP);
+        failed = true;
+      }
+      yield();
+      count++;
+    }
+    if (!failed){
+      Serial.flush();
+      esp_light_sleep_start(); 
 
+}
+
+//helper functions
+void stop() {
+  for (int i = 0; i < errorIndex; i++) {
+    Serial.println(errorLog[i]);
 void setupDeviceID(){
   preferences.begin("storage", false);
 
@@ -1041,34 +1108,93 @@ void sendOldNmeaToSocket(){
     nmeaIndex = writeIndex;
   }
 }
-// -- Universal helpers
-void addError(int code) {
-  if (errorIndex < 64) {
-    errorLog[errorIndex++] = code;
-  }
+
+// INA219 I2C Helper functions
+void INA219_writeRegister(uint8_t reg, uint16_t value) {
+  Wire.beginTransmission(INA219_ADDR);
+  Wire.write(reg);
+  Wire.write((value >> 8) & 0xFF); // High byte
+  Wire.write(value & 0xFF);        // Low byte
+  Wire.endTransmission();
 }
 
-void stop() {
-  for (int i = 0; i < errorIndex; i++) {
-    Serial.println(errorLog[i]);
+uint16_t INA219_readRegister(uint8_t reg) {
+  Wire.beginTransmission(INA219_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission();
+  
+  Wire.requestFrom(INA219_ADDR, (uint8_t)2);
+  if (Wire.available() >= 2) {
+    uint16_t value = Wire.read() << 8;
+    value |= Wire.read();
+    return value;
   }
-  ESP.restart();
+  return 0;
 }
 
-String getTime() {
-  if (getGPS()) {
-    if (gpsFields[10].length() >= 6) {
-      return gpsFields[10].substring(0, 6); 
-    }
-  }
-  return "000000";
+void setupINA219() {
+  // Config value calculated from Python: 
+  // (RANGE_16V << 13) | (DIV_2_80MV << 11) | (ADCRES_12BIT_32S << 7) | (ADCRES_12BIT_32S << 3) | SANDBVOLT_CONTINUOUS
+  // 0x0000 | 0x0800 | 0x0680 | 0x0068 | 0x0007 = 0x0EEF
+  uint16_t config = 0x0EEF; 
+  
+  INA219_writeRegister(_REG_CALIBRATION, INA219_CAL_VALUE);
+  INA219_writeRegister(_REG_CONFIG, config);
+  Serial.println("INA219 Initialized.");
 }
 
-String getDate() {
-  if(getGPS()){
-    if (gpsFields[9].length() >= 2) {
-      return gpsFields[9].substring(0, 2);
-    }
-  }
-  return "00";
+float INA219_getBusVoltage_V() {
+  INA219_writeRegister(_REG_CALIBRATION, INA219_CAL_VALUE);
+  uint16_t value = INA219_readRegister(_REG_BUSVOLTAGE);
+  return (int16_t)(value >> 3) * 0.004;
+}
+
+float INA219_getShuntVoltage_mV() {
+  INA219_writeRegister(_REG_CALIBRATION, INA219_CAL_VALUE);
+  int16_t value = (int16_t)INA219_readRegister(_REG_SHUNTVOLTAGE);
+  return value * 0.01;
+}
+
+float INA219_getCurrent_mA() {
+  int16_t value = (int16_t)INA219_readRegister(_REG_CURRENT);
+  return value * INA219_CURRENT_LSB;
+}
+
+float INA219_getPower_W() {
+  INA219_writeRegister(_REG_CALIBRATION, INA219_CAL_VALUE);
+  int16_t value = (int16_t)INA219_readRegister(_REG_POWER);
+  return value * INA219_POWER_LSB;
+}
+
+void checkPowerStatus() {
+  float bus_voltage = INA219_getBusVoltage_V();
+  float shunt_voltage = INA219_getShuntVoltage_mV() / 1000.0;
+  float current = -INA219_getCurrent_mA();
+  float power = INA219_getPower_W();
+  
+  // Calculate battery percentage based on a 3.0V to 4.2V scale (1.2V span)
+  float p = (bus_voltage - 3.0) / 1.2 * 100.0;
+  if (p > 100.0) p = 100.0;
+  if (p < 0.0) p = 0.0;
+
+  Serial.print("Load Voltage:  ");
+  Serial.print(bus_voltage, 3);
+  Serial.println(" V");
+
+  Serial.print("Current:       ");
+  Serial.print(current / 1000.0, 3);
+  Serial.println(" A");
+
+  Serial.print("Power:         ");
+  Serial.print(power, 3);
+  Serial.println(" W");
+
+  Serial.print("Percent:       ");
+  Serial.print(p, 1);
+  Serial.println("%");
+
+}
+
+bool isActive(){
+  return INA219_getCurrent_mA() < -15.0;
 }
