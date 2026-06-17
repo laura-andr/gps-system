@@ -774,7 +774,7 @@ void buildNmea(){
   csvToArray(gpsData, ',', gpsFields, 18);
 
   if (gpsFields[0] == "" || gpsFields[0] == "0" || gpsFields[5] == "" || gpsFields[7] == ""){
-    nmeaSentence = "$GNRMC,,V,,,,,,,,,,N,V"; 
+    nmeaSentence = "$GPRMC,,V,,,,,,,,,,N,V"; 
   }
   else {
     String lat = ddToDegMin(gpsFields[5], true);
