@@ -71,7 +71,8 @@ const String version_url = "https://dl.dropboxusercontent.com/scl/fi/r0rhfi73h7i
 const String firmware_url = "https://dl.dropboxusercontent.com/scl/fi/1x22iaxccj0rqc2e2tuvf/firmware.ino.bin?rlkey=eh8112jyw16821s8k884o9d76&st=u3ulhjbe&dl=1";
 
   // gps constant
-const int GPS_INTERVAL = 10; // tracking interval in seconds
+const int ACTIVE_GPS_INTERVAL = 10; // tracking interval in seconds
+const int IDLE_GPS_INTERVAL = 30*60; 
 
   // send old location constants
 const int NMEA_ARRAY_LENGTH = 1500; // number old nmea sentences stored
@@ -113,6 +114,38 @@ int firmwareSize = 0;
 int errorLog[64];
 int errorIndex = 0;
 
+// Function prototypes
+void setupDeviceID();
+void setupSSL();
+void setupPDP();
+void setupGPS();
+void fixLocation();
+void startSocket();
+bool ATNETOPEN();
+bool ATNETCLOSE();
+bool ATCIPOPEN(String host, String port, String channel);
+String sendAT(String msg, unsigned long timeout);
+bool sendATincludes(String msg, String inclusion, unsigned long timeout);
+String sendATHTTPREAD(String numBytesToRead, unsigned long timeout);
+void waitForResponse();
+long httpGET(String url);
+int checkVersion();
+void downloadNewVersion();
+void checkAndDoOTA();
+bool getGPS();
+void buildNmea();
+String ddToDegMin(String dd_str, bool isLatitude);
+double calculateFlatDistance(double lat1, double lon1, double lat2, double lon2);
+double distanceMeters(double lat1_dm, double lon1_dm, double lat2_dm, double lon2_dm);
+int csvToArray(String data, char separator, String* arrayOut, int maxItems);
+String addChecksum(String sentence);
+void addNmeaToArray();
+bool CIPSEND(String payload, String channel);
+void sendNmeaSentence();
+void sendOldNmeaToSocket();
+void stop();
+void addError(int code);
+
 void setup() {
   delay(3000);
   Serial.begin(115200);
@@ -141,25 +174,14 @@ void setup() {
   sinceLastWakeup = millis();
 }
 
-
 void loop() {
-  if (isActive()){
-     if (millis() - lastLocUpdate >= (GPS_INTERVAL * 1000)){
-       checkPowerStatus();
-       lastLocUpdate = millis();
-       if (getGPS()){
-         startSocket(); 
-       }
-      }
-    if(millis() - lastLocUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
-      lastLocUpdate = millis();
-      if (getGPS()){
-        startSocket(); 
-        sendNmeaSentence();
-      }
+  if(millis() - lastLocUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
+    lastLocUpdate = millis();
+    if (getGPS()){
+      startSocket(); 
+      sendNmeaSentence();
     }
   } else {
-    checkPowerStatus();
     checkAndDoOTA();
     sinceLastWakeup = millis() - lastLocUpdate;
     lastLocUpdate = millis();    
@@ -187,13 +209,25 @@ void loop() {
     if (!failed){
       Serial.flush();
       esp_light_sleep_start(); 
-
+    }
+  }
 }
 
 //helper functions
+
 void stop() {
   for (int i = 0; i < errorIndex; i++) {
     Serial.println(errorLog[i]);
+  }
+  ESP.restart();
+}
+
+void addError(int code) {
+  if (errorIndex < 64) {
+    errorLog[errorIndex++] = code;
+  }
+}
+
 void setupDeviceID(){
   preferences.begin("storage", false);
 
@@ -209,17 +243,25 @@ void setupDeviceID(){
   preferences.end();
 }
 
-void setupSSL(){
-  sendAT("AT+HTTPTERM", TO_CELL);
-  delay(100);
-  sendAT("AT+HTTPINIT", TO_CELL);
-  delay(100);
-
-  sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); 
-  sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   
-  sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);  
-  sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL);
+String getTime() {
+  if (getGPS()) {
+    if (gpsFields[10].length() >= 6) {
+      return gpsFields[10].substring(0, 6); 
+    }
+  }
+  return "000000";
 }
+
+String getDate() {
+  if(getGPS()){
+    if (gpsFields[9].length() >= 2) {
+      return gpsFields[9].substring(0, 2);
+    }
+  }
+  return "00";
+}
+
+// --- Network / AT helpers ---
 
 void setupPDP(){
   bool recovered = true;
@@ -277,6 +319,18 @@ void setupPDP(){
   sendAT("AT+CGSOCKCONT=1,\"IP\",\"" + APN + "\"", TO_CELL);
 }
 
+void setupSSL(){
+  sendAT("AT+HTTPTERM", TO_CELL);
+  delay(100);
+  sendAT("AT+HTTPINIT", TO_CELL);
+  delay(100);
+
+  sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); 
+  sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   
+  sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);  
+  sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL);
+}
+
 void startSocket(){
   String ipResponse = sendAT("AT+CGPADDR=1", TO_LOCAL);
   if (ipResponse.indexOf("\"\"") != -1 || ipResponse.indexOf("ERROR") != -1 || ipResponse.indexOf("+CGPADDR:") == -1) {
@@ -290,7 +344,6 @@ void startSocket(){
   }
 }
 
-// --- Network / AT helpers ---
 bool ATNETOPEN(){
   unsigned long timeout = TO_CELL;
   for (int tries = 0; tries<4; tries++) {
