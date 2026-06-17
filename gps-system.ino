@@ -1,6 +1,8 @@
-//import libraries 
-#include <Arduino.h>
-#include <Wire.h> // Added for I2C communication with INA219
+//import libraries
+#include  <Arduino.h>
+#include <Update.h>
+#include <Wire.h>
+#include <Preferences.h>
 
 //define physical pins
 #define RX2 16
@@ -17,12 +19,6 @@
 #define _REG_CURRENT          0x04
 #define _REG_CALIBRATION      0x05
 
-// INA219 Driver Constants & Tracking Variable
-const uint16_t INA219_CAL_VALUE = 26868;
-const float INA219_CURRENT_LSB = 0.1524; // mA per bit
-const float INA219_POWER_LSB = 0.003048; // W per bit
-int lowVoltageCounter = 0;               // Replaces python 'low = 0'
-
 //Error Logs
 #define ERR_AT_TIMEOUT 100
 #define ERR_AT_FAILURE 101
@@ -37,167 +33,146 @@ int lowVoltageCounter = 0;               // Replaces python 'low = 0'
 #define ERR_NET_IP 305
 #define ERR_INIT_SOCKET_CONNECTION 400
 #define ERR_SOCKET_MSG_FAILURE 401
-#define ERR_LIGHTSLEEP 500
+#define ERR_HTTP_INIT_FAILURE 500
+#define ERR_HTTP_GET_FAILURE 501
+#define ERR_VERSION_FILE_SIZE 502
+#define ERR_VERSION_FILE_READ 503
+#define ERR_FIRMWARE_SIZE 504
+#define ERR_INSUFFICIENT_SPACE 505
+#define ERR_READ_UPDATE 506
+#define ERR_UPDATE_FAILURE 507
+#define ERR_LIGHTSLEEP 600
 
-//define error log
-int errorLog[64];
-int errorIndex = 0;
+// begin define constants 
 
-//define constants
+  // INA219 Driver Constants & Tracking Variable
+const uint16_t INA219_CAL_VALUE = 26868;
+const float INA219_CURRENT_LSB = 0.1524; // mA per bit
+const float INA219_POWER_LSB = 0.003048; // W per bit
+int lowVoltageCounter = 0;               // Replaces python 'low = 0'
+
+  // network registration
 const String APN = "fast.t-mobile.com";
-const String curLocHost = "www.botech.com.co";
-const String curLocPort = "9504";
-const String oldLocHost = "dev.botech.com.co";
-const String oldLocPort = "9504";
-const String DEVICE_ID = "189";
-unsigned long ACTIVE_GPS_INTERVAL = 10; // active mode tracking interval in seconds
-unsigned long IDLE_GPS_INTERVAL = 30*60; // idle mode tracking interval
-const int NMEA_MAX_LENGTH = 82;
-const int PACKAGE_SIZE = 100;
 
+  // socket constants
+const String locHost = "www.botech.com.co";
+const String locPort = "9504";
+const String locChannel = "0";
+
+  // ota constants -- must be changed every update
+const int LOCAL_VERSION = 0;
+const String dateLastOTA = "000000";
+
+  // ota update time
+const String UPDATE_TIME_UTC = "070000.00"; //hhmmss.ss
+
+  // ota urls https://dl.dropboxusercontent.com/scl/fi/.../<filename>?rlkey=...&st=...&dl=1
+const String version_url = "https://dl.dropboxusercontent.com/scl/fi/r0rhfi73h7iciwrlumrls/version.txt?rlkey=ddjovrejh5wg06vr26z63uvmu&st=9zyuv7eo&dl=1";
+const String firmware_url = "https://dl.dropboxusercontent.com/scl/fi/1x22iaxccj0rqc2e2tuvf/firmware.ino.bin?rlkey=eh8112jyw16821s8k884o9d76&st=u3ulhjbe&dl=1";
+
+  // gps constant
+const int GPS_INTERVAL = 10; // tracking interval in seconds
+
+  // send old location constants
+const int NMEA_ARRAY_LENGTH = 1500; // number old nmea sentences stored
+const int PACKAGE_SIZE = 100; // number old nmea sentences sent at once
+
+  // threshold values to limit number of old nmea sentences stored
 const int THRESH_SPEED = 13; //in knots
 const int THRESH_DIST = 300; //in meters
 const int THRESH_BEARING = 10; //in degrees
 
-//timeouts
+  // AT command timeouts
 const unsigned long TO_LOCAL = 2000;
 const unsigned long TO_CELL = 10000;
 const unsigned long TO_SOCKET = 10000;
 
-//global variables
-unsigned long lastUpdate;
+//begin define global variables
+
+  // device id
+Preferences preferences;
+String DEVICE_ID = "000";
+//String DEVICE_ID = "189";
+
+  // gps global variables
+unsigned long lastLocUpdate;
+unsigned long sinceLastWakeup;
 unsigned long gpsStartTime;
 String gpsData;
 String gpsFields[18];
 String nmeaSentence;
-String nmeaArray[NMEA_MAX_LENGTH];
+String nmeaArray[NMEA_ARRAY_LENGTH];
 int nmeaIndex = 0;
-int failuresToSend = 0;
-String curLocChannel = "0";
-String oldLocChannel = "1";
 
-//function headers
-void stop();
-void addError(int code);
-void waitForResponse();
-String ddToDegMin(String dd_str, bool isLatitude);
-double calculateFlatDistance(double lat1, double lon1, double lat2, double lon2);
-double distanceMeters(double lat1_dm, double lon1_dm, double lat2_dm, double lon2_dm);
-int csvToArray(String data, char separator, String* arrayOut, int maxItems);
-String addChecksum(String sentence);
-bool ATNETOPEN();
-bool ATNETCLOSE();
-bool ATCIPOPEN(String host, String port, String channel);
-String sendAT(String msg, unsigned long timeout);
-bool sendATincludes(String msg, String inclusion, unsigned long timeout);
-void setupGPS();
-void setupPDP();
-void fixLocation();
-void startSocket();
-bool getGPS();
-bool CIPSEND(String payload, String channel);
-void addNmeaToArray();
-void buildNmea();
-void sendOldNmeaToSocket();
-bool isSocketConnected(String channel);
-void INA219_writeRegister(uint8_t reg, uint16_t value);
-uint16_t INA219_readRegister(uint8_t reg);
-void setupINA219();
-float INA219_getBusVoltage_V();
-float INA219_getShuntVoltage_mV();
-float INA219_getCurrent_mA();
-float INA219_getPower_W();
-void checkPowerStatus();
+  // ota global variables
+bool otaExecutedToday = false; 
+int serverVersion = 0;
+int firmwareSize = 0;
+
+  // error log global variables
+int errorLog[64];
+int errorIndex = 0;
 
 void setup() {
   delay(3000);
   Serial.begin(115200);
   Serial2.begin(115200, SERIAL_8N1, RX2, TX2);
-  delay(1000);
-    
-  Serial2.println("AT");
-  delay(500);
-
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setTimeOut(50);
   setupINA219();
-
-  while(Serial2.available()){
-    Serial.write(Serial2.read());
-  }
+  
+  delay(1000);
+  
+  setupDeviceID();
+  
+  delay(1000);
+  sendAT("AT", TO_LOCAL);
   delay(1000);
   sendAT("AT+IPR=115200", TO_LOCAL);
   delay(1000);
+  
   setupGPS();
   setupPDP();
-  sendAT("AT+CSIMSLEEP=0", TO_LOCAL);
   fixLocation();
   startSocket();
+  setupSSL();
 
-  lastUpdate = millis();
+  lastLocUpdate = millis();
+  sinceLastWakeup = millis();
 }
+
 
 void loop() {
   if (isActive()){
-    if(millis() - lastUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
-      sendAT("AT+CGNSSWAKEUP", TO_LOCAL);
-      lastUpdate = millis();
-      Serial.println(INA219_getCurrent_mA()/1000.0);
+     if (millis() - lastLocUpdate >= (GPS_INTERVAL * 1000)){
+       checkPowerStatus();
+       lastLocUpdate = millis();
+       if (getGPS()){
+         startSocket(); 
+       }
+      }
+    if(millis() - lastLocUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
+      lastLocUpdate = millis();
       if (getGPS()){
         startSocket(); 
-        
-        String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
-        if(!CIPSEND(payload, curLocChannel)){
-          failuresToSend++;
-          addNmeaToArray();
-          addError(ERR_SOCKET_MSG_FAILURE);
-        }
-        else{
-          failuresToSend = 0;
-          if (nmeaIndex > 0) {
-            sendOldNmeaToSocket();
-          }
-        }
-      }
-      
-      if (failuresToSend >= 3){
-        if (!sendATincludes("AT+CEREG?", "+CEREG: 0,1", TO_CELL)){
-          addError(ERR_NET_REGISTRATION);
-          sendAT("AT+COPS=2", TO_CELL);
-          sendAT("AT+COPS=0", TO_CELL);
-          
-          unsigned long regStart = millis();
-          while(millis() - regStart < 15000) {
-            if (sendATincludes("AT+CEREG?", "+CEREG: 0,1", TO_CELL)) break;
-            delay(1000);
-          }
-        }
-        else{
-          startSocket(); 
-        }
-        failuresToSend = 0;
+        sendNmeaSentence();
       }
     }
   } else {
-    Serial.println("hello");
     checkPowerStatus();
-    unsigned long sinceLastWakeup = millis() - lastUpdate;
-    lastUpdate = millis();    
+    checkAndDoOTA();
+    sinceLastWakeup = millis() - lastLocUpdate;
+    lastLocUpdate = millis();    
     uint64_t sleepMs = IDLE_GPS_INTERVAL * 1000;
     if (sleepMs > sinceLastWakeup) {
       sleepMs -= sinceLastWakeup;
-    } else {
-      sleepMs = 1000;
     }
     uint64_t interval = sleepMs * 1000ULL;
     sendAT("AT+CGPSHOT", TO_LOCAL);
     fixLocation();
     if (getGPS()){
       startSocket();
-      String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
-      if(!CIPSEND(payload, curLocChannel)){
-        addError(ERR_SOCKET_MSG_FAILURE);
-      }
+      sendNmeaSentence();
     }
     int count = 0;
     bool failed = false;
@@ -212,125 +187,110 @@ void loop() {
     if (!failed){
       Serial.flush();
       esp_light_sleep_start(); 
-    }
-  }
+
 }
 
 //helper functions
 void stop() {
   for (int i = 0; i < errorIndex; i++) {
     Serial.println(errorLog[i]);
+void setupDeviceID(){
+  preferences.begin("storage", false);
+
+  DEVICE_ID = preferences.getString("dev_id", "189");
+  
+  if (DEVICE_ID == "189" && !preferences.isKey("dev_id")) {
+    preferences.putString("dev_id", "189");
   }
-  ESP.restart();
+  
+  Serial.print("\n[SYSTEM] Persistent Hardware Device ID Loaded: ");
+  Serial.println(DEVICE_ID);
+  
+  preferences.end();
 }
 
-void addError(int code) {
-  if (errorIndex < 64) {
-    errorLog[errorIndex++] = code;
-  }
+void setupSSL(){
+  sendAT("AT+HTTPTERM", TO_CELL);
+  delay(100);
+  sendAT("AT+HTTPINIT", TO_CELL);
+  delay(100);
+
+  sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); 
+  sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   
+  sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);  
+  sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL);
 }
 
-void waitForResponse(){
-  unsigned long startWait = millis();
-  while (Serial2.available() == 0){
-    if (millis() - startWait > 2000) {
+void setupPDP(){
+  bool recovered = true;
+  if (!sendATincludes("AT+CEREG?", ",1", TO_CELL) && !sendATincludes("AT+CEREG?", ",5", TO_CELL)) {  
+    sendAT("AT+COPS=2", TO_CELL); 
+    delay(1500);
+    sendAT("AT+COPS=0", TO_CELL); 
+    
+    unsigned long regStart = millis();
+    bool recovered = false;
+    
+    while (millis() - regStart < 15000) {
+      if (sendATincludes("AT+CEREG?", ",1", TO_CELL) || sendATincludes("AT+CEREG?", ",5", TO_CELL)) {
+        recovered = true;
+        break; 
+      }
+      delay(1000);
       yield();
-      return;
-    }
-  }
-}
-
-String ddToDegMin(String dd_str, bool isLatitude) {
-  if (dd_str.length() == 0) return "";
-
-  double dd = dd_str.toFloat();
-  bool negative = dd < 0.0;
-  if (negative) dd = -dd;
-
-  int deg = (int)dd;
-  double frac = dd - (double)deg;
-  double minutes = frac * 60.0;
-
-  // handle rounding that would push minutes to 60.0000
-  long minFrac = (long)round((minutes - floor(minutes)) * 10000.0);
-  int minWhole = (int)floor(minutes);
-  if (minFrac >= 10000) {
-    minFrac = 0;
-    minWhole += 1;
-    if (minWhole >= 60) {
-      minWhole = 0;
-      deg += 1;
     }
   }
 
-  char buf[20];
-  if (isLatitude) {
-    // degrees: 2 digits, minutes: 2 digits + '.' + 4 decimals
-    sprintf(buf, "%02d%02d.%04ld", deg, minWhole, minFrac);
-  } else {
-    // degrees: 3 digits
-    sprintf(buf, "%03d%02d.%04ld", deg, minWhole, minFrac);
+  if (!recovered){
+    addError(ERR_NET_REGISTRATION);
+    stop();
   }
 
-  return String(buf);
-}
+  sendAT("AT+CGACT=0,1", TO_CELL);
 
-double calculateFlatDistance(double lat1, double lon1, double lat2, double lon2) {
-  double latMid = (lat1 + lat2) * 0.017453292519943295 / 2.0; 
-  double m_per_deg_lat = 111132.954 - 559.822 * cos(2 * latMid) + 1.175 * cos(4 * latMid);
-  double m_per_deg_lon = 111412.84 * cos(latMid) - 93.5 * cos(3 * latMid);
-
-  double deltaLat = (lat1 - lat2) * m_per_deg_lat;
-  double deltaLon = (lon1 - lon2) * m_per_deg_lon;
-
-  return sqrt(deltaLat * deltaLat + deltaLon * deltaLon); 
-}
-
-double distanceMeters(double lat1_dm, double lon1_dm, double lat2_dm, double lon2_dm) {
-  auto dmToDec = [](double dm)->double {
-    int deg = (int)(dm / 100.0);
-    double minutes = dm - (double)deg * 100.0;
-    return (double)deg + (minutes / 60.0);
-  };
-
-  double lat1 = dmToDec(lat1_dm);
-  double lon1 = dmToDec(lon1_dm);
-  double lat2 = dmToDec(lat2_dm);
-  double lon2 = dmToDec(lon2_dm);
-
-  return calculateFlatDistance(lat1, lon1, lat2, lon2);
-}
-
-int csvToArray(String data, char separator, String* arrayOut, int maxItems) {
-  int arrayIndex = 0;
-  int fromIndex = 0;
-  int sepIndex = 0;
-
-  while ((sepIndex = data.indexOf(separator, fromIndex)) != -1 && arrayIndex < maxItems - 1) {
-    arrayOut[arrayIndex++] = data.substring(fromIndex, sepIndex);
-    fromIndex = sepIndex + 1;
+  String cmd = "AT+CGDCONT=1,\"IPV4V6\",\"" + APN + "\"";
+  if (sendATincludes(cmd, "ERROR", TO_CELL)){    
+    addError(ERR_NET_APN);
+    stop();
   }
-  if (arrayIndex < maxItems) {
-    arrayOut[arrayIndex++] = data.substring(fromIndex);
-  }
-  return arrayIndex; 
-}
 
-String addChecksum(String sentence) {
-    int check = 0;
-    int startIndex = (sentence.charAt(0) == '$') ? 1 : 0;
-    
-    for (int i = startIndex; i < sentence.length(); i++) {
-        check ^= sentence.charAt(i);
+  if (sendATincludes("AT+CGACT=1,1", "ERROR", TO_CELL)){
+    addError(ERR_NET_ACTIVATION);
+    stop();
+  }
+
+  if (!sendATincludes("AT+NETOPEN?", "+NETOPEN: 1", TO_CELL)){
+    if (!ATNETOPEN()){
+      ATNETCLOSE();
+      if(!ATNETOPEN()){
+        stop();
+      }
     }
-    
-    String hexCheck = String(check, HEX);
-    hexCheck.toUpperCase();
-    if (hexCheck.length() < 2) hexCheck = "0" + hexCheck;
-    
-    return sentence + "*" + hexCheck;
+  }
+
+  String ipResponse = sendAT("AT+CGPADDR=1", TO_LOCAL);
+  if (!(ipResponse.indexOf("+CGPADDR:") != -1 &&  ipResponse.indexOf("\"\"") == -1 && ipResponse.indexOf("ERROR") == -1)) {
+   addError(ERR_NET_IP);
+   stop();
+  }
+  //may not be needed
+  sendAT("AT+CGSOCKCONT=1,\"IP\",\"" + APN + "\"", TO_CELL);
 }
 
+void startSocket(){
+  String ipResponse = sendAT("AT+CGPADDR=1", TO_LOCAL);
+  if (ipResponse.indexOf("\"\"") != -1 || ipResponse.indexOf("ERROR") != -1 || ipResponse.indexOf("+CGPADDR:") == -1) {
+    sendAT("AT+NETCLOSE", TO_CELL);
+    delay(500);
+    setupPDP(); 
+  }
+
+  if (!sendATincludes("AT+CIPOPEN?", "+CIPOPEN: " + locChannel + ",", TO_LOCAL)) {
+    ATCIPOPEN(locHost, locPort, locChannel);
+  }
+}
+
+// --- Network / AT helpers ---
 bool ATNETOPEN(){
   unsigned long timeout = TO_CELL;
   for (int tries = 0; tries<4; tries++) {
@@ -510,6 +470,302 @@ bool sendATincludes(String msg, String inclusion, unsigned long timeout){
   return response.indexOf(inclusion) != -1;
 }
 
+
+String sendATHTTPREAD(String numBytesToRead, unsigned long timeout) {
+  while (Serial2.available() > 0) {
+      Serial.write(Serial2.read());
+  }
+  Serial2.println("AT+HTTPREAD=0,"+numBytesToRead);
+  
+  unsigned long start = millis();
+  String curLine = "";
+  bool headerFound = false;
+  int dataLen = -1;
+  String payload = "";
+  int bytesCollected = 0;
+
+  while (millis() - start < timeout) {
+    while (Serial2.available() > 0) {
+      char c = Serial2.read();
+      Serial.write(c); 
+
+      if (!headerFound) {
+        if (c == '\n') {
+          curLine.trim();
+          if (curLine.length() > 0) {
+            if (curLine.indexOf("ERROR") != -1) {
+              return ""; 
+            }
+            int idx = curLine.indexOf("+HTTPREAD:");
+            if (idx != -1) {
+              String lenStr = curLine.substring(idx + 10);
+              lenStr.trim();
+              dataLen = lenStr.toInt();
+              headerFound = true;
+              if (dataLen <= 0) return "";
+            }
+          }
+          curLine = "";
+        } else if (c != '\r') {
+          curLine += c;
+        }
+      } else {
+        payload += c;
+        bytesCollected++;
+        if (bytesCollected >= dataLen) {
+          if (payload.length() > dataLen) {
+            return payload.substring(0, dataLen);
+          }
+          return payload;
+        }
+      }
+    }
+    yield();
+  }
+
+  return "";
+}
+
+void waitForResponse(){
+  unsigned long startWait = millis();
+  while (Serial2.available() == 0){
+    if (millis() - startWait > 2000) {
+      yield();
+      return;
+    }
+  }
+}
+
+// --- HTTP/OTA helpers ---
+long httpGET(String url) {
+  int tries = 0;
+
+  while (tries < 3){
+    sendAT("AT+HTTPTERM", TO_CELL); 
+    delay(100);
+    
+    if (!sendATincludes("AT+HTTPINIT", "OK", TO_CELL)){
+      addError(ERR_HTTP_INIT_FAILURE);
+      tries++;
+      delay(500);
+      continue;
+    } 
+    
+    if (!sendATincludes("AT+HTTPPARA=\"URL\",\"" + url + "\"", "OK", TO_CELL)){
+      addError(ERR_HTTP_GET_FAILURE);
+      sendAT("AT+HTTPTERM", TO_CELL);
+      tries++;
+      delay(500);
+      continue;
+    } 
+    
+    Serial2.println("AT+HTTPACTION=0");
+    
+    String actionResponse = "";
+    unsigned long actionStart = millis();
+    bool foundActionNotification = false;
+    
+    while (millis() - actionStart < 20000) { 
+      while (Serial2.available() > 0) {
+        char c = Serial2.read();
+        Serial.write(c); 
+        actionResponse += c;
+        
+        if (actionResponse.indexOf("+HTTPACTION:") != -1 && actionResponse.endsWith("\n")) {
+          foundActionNotification = true;
+          break;
+        }
+      }
+      if (foundActionNotification) break;
+      yield();
+    }
+    
+    Serial.println("FULL ACTION RESP: [" + actionResponse + "]");
+
+    int actionIdx = actionResponse.indexOf("+HTTPACTION:");
+    if (actionIdx != -1) {
+      int firstComma = actionResponse.indexOf(",", actionIdx);
+      int secondComma = actionResponse.indexOf(",", firstComma + 1);
+      String status = actionResponse.substring(firstComma + 1, secondComma);
+      status.trim();
+      
+      if (status == "200") {
+        String sizeStr = actionResponse.substring(secondComma + 1);
+        sizeStr.trim();
+        return sizeStr.toInt(); 
+      } else {
+        Serial.printf("\nDropbox Connection Rejected. Error Code: %s\n", status.c_str());
+      }
+    }
+    
+    tries++;
+    delay(500);
+  }
+  
+  addError(ERR_HTTP_GET_FAILURE);
+  return 0; 
+}
+
+int checkVersion() {
+  Serial.println("\nChecking for available firmware updates...");
+  
+  long metadataFileSize = httpGET(version_url); 
+  if (metadataFileSize <= 0) {
+    addError(ERR_VERSION_FILE_SIZE);
+    Serial.println("[ERROR] Failed to obtain valid version.txt size from server.");
+    return -1;
+  }
+  
+  int tries = 0;
+  while (tries < 3) {
+    String response = sendATHTTPREAD(String(metadataFileSize), TO_CELL);
+    Serial.println("READRESPONSE"+response);
+
+    int newlineIdx = response.indexOf("\n");
+    if (newlineIdx != -1) {
+      String verStr = response.substring(0, newlineIdx);
+      String sizeStr = response.substring(newlineIdx + 1);
+      verStr.trim();
+      sizeStr.trim();
+      
+      serverVersion = verStr.toInt();
+      firmwareSize = sizeStr.toInt();
+      
+      Serial.printf("[SUCCESS] Metadata Sync -> Target Version: %d | Expected Size: %ld bytes\n", serverVersion, firmwareSize);
+      return serverVersion;
+    } else {
+      Serial.println("[ERROR] Failed to parse version information.");
+      stop();
+    }
+  }
+  return -1;
+}
+
+void downloadNewVersion() {
+  checkVersion();
+  if (firmwareSize <= 0) {
+    Serial.println("Error: Valid firmware size not found. Aborting.");
+    return;
+  }
+
+  if (!Update.begin(firmwareSize)) {
+    Serial.printf("CRITICAL ERROR: File size (%ld bytes) exceeds available space!\n", firmwareSize);
+    return;
+  }
+
+  long currentPosition = 0;
+  const int chunkSize = 1024; 
+  bool downloadComplete = false;
+
+  while (currentPosition < firmwareSize && !downloadComplete) {
+    sendAT("AT+HTTPTERM", TO_CELL);
+    delay(100);
+    sendAT("AT+HTTPINIT", TO_CELL);
+    delay(100);
+    sendAT("AT+HTTPPARA=\"URL\",\"" + firmware_url + "\"", TO_CELL);
+
+    long endPosition = currentPosition + chunkSize - 1;
+    if (endPosition >= firmwareSize) {
+      endPosition = firmwareSize - 1;
+    }
+    long targetBytesThisChunk = (endPosition - currentPosition) + 1;
+    
+    String rangeHeader = "Range: bytes=" + String(currentPosition) + "-" + String(endPosition);
+    sendAT("AT+HTTPPARA=\"USERDATA\",\"" + rangeHeader + "\"", TO_CELL);
+
+    Serial2.println("AT+HTTPACTION=0");
+    
+    String actionResponse = "";
+    unsigned long actionStart = millis();
+    int receivedBytes = 0;
+    while (millis() - actionStart < 20000) {
+      while (Serial2.available() > 0) {
+        char c = Serial2.read();
+        Serial.write(c);
+        actionResponse += c;
+        if (actionResponse.indexOf("+HTTPACTION:") != -1 && actionResponse.endsWith("\n")) break;
+      }
+      if (actionResponse.indexOf("+HTTPACTION:") != -1) break;
+      yield();
+    }
+
+    int actionIdx = actionResponse.indexOf("+HTTPACTION:");
+    if (actionIdx != -1) {
+      int firstComma = actionResponse.indexOf(",", actionIdx);
+      int secondComma = actionResponse.indexOf(",", firstComma + 1);
+      String status = actionResponse.substring(firstComma + 1, secondComma);
+      status.trim();
+
+      if (status == "200" || status == "206") {
+        String sizeStr = actionResponse.substring(secondComma + 1);
+        sizeStr.trim();
+        receivedBytes = sizeStr.toInt();
+      } else {
+        Serial.printf("\nNetwork error at position %ld. Status: %s\n", currentPosition, status.c_str());
+        Update.abort();
+        return;
+      }
+    } else {
+      Serial.println("No HTTPACTION response received.");
+      Update.abort();
+      return;
+    }
+
+    if (receivedBytes <= 0) {
+      downloadComplete = true;
+      break;
+    }
+
+    String payload = sendATHTTPREAD(String(targetBytesThisChunk), TO_CELL);
+    if (payload.length() == 0) {
+      Serial.println("Error: HTTPREAD returned no data.");
+      Update.abort();
+      return;
+    }
+
+    int bytesToWrite = payload.length();
+    if (bytesToWrite > (firmwareSize - currentPosition)) {
+      bytesToWrite = firmwareSize - currentPosition;
+    }
+
+    int bytesWritten = 0;
+    for (int i = 0; i < bytesToWrite; i++) {
+      uint8_t b = (uint8_t)payload.charAt(i);
+      Update.write(&b, 1);
+      bytesWritten++;
+      currentPosition++;
+    }
+
+    Serial.printf("Verified Download Progress: %.2f%% (%ld / %ld bytes flashed)\n",
+                  ((float)currentPosition / firmwareSize) * 100, currentPosition, firmwareSize);
+    
+    if (currentPosition >= firmwareSize) {
+      downloadComplete = true;
+    }
+  }
+
+  if (Update.end() && Update.isFinished()) {
+    Serial.println("\n[SUCCESS] Binary matches signature constraints! Rebooting...");
+    sendAT("AT+HTTPTERM", TO_CELL);
+    delay(500);
+    ESP.restart();
+  } else {
+    Serial.printf("\n[FAILURE] Update verification failed. Core reason: %s\n", Update.errorString());
+    sendAT("AT+HTTPTERM", TO_CELL);
+  }
+}
+
+void checkAndDoOTA(){
+  String curTime = getTime();
+  if (curTime <= UPDATE_TIME_UTC) {
+    String curDate = getDate();
+    if (dateLastOTA != curDate) {
+      downloadNewVersion();
+    }
+  }
+}
+
+//-- GPS Helpers--
 void setupGPS(){
   sendAT("AT+CGNSSPWR=0", TO_LOCAL);
   delay(500);
@@ -531,41 +787,6 @@ void setupGPS(){
   }
 }
 
-void setupPDP(){
-  if (sendATincludes("AT+CEREG=1", "ERROR", TO_CELL)){
-    addError(ERR_NET_REGISTRATION);
-    stop();
-  }
-
-  sendAT("AT+CGACT=0,1", TO_CELL);
-
-  String cmd = "AT+CGDCONT=1,\"IPV4V6\",\"" + APN + "\"";
-  if (sendATincludes(cmd, "ERROR", TO_CELL)){    
-    addError(ERR_NET_APN);
-    stop();
-  }
-
-  if (sendATincludes("AT+CGACT=1,1", "ERROR", TO_CELL)){
-    addError(ERR_NET_ACTIVATION);
-    stop();
-  }
-
-  if (!sendATincludes("AT+NETOPEN?", "+NETOPEN: 1", TO_CELL)){
-    if (!ATNETOPEN()){
-      ATNETCLOSE();
-      if(!ATNETOPEN()){
-        stop();
-      }
-    }
-  }
-
-  String ipResponse = sendAT("AT+CGPADDR=1", TO_LOCAL);
-  if (!(ipResponse.indexOf("+CGPADDR:") != -1 &&  ipResponse.indexOf("\"\"") == -1 && ipResponse.indexOf("ERROR") == -1)) {
-   addError(ERR_NET_IP);
-   stop();
-  }
-}
-
 void fixLocation(){
   String response = sendAT("AT+CGNSSINFO", TO_LOCAL);
   if (response.indexOf("ERROR") != -1){
@@ -584,14 +805,6 @@ void fixLocation(){
   Serial.println("GPS location fixed");
 }
 
-void startSocket(){
-  if (!sendATincludes("AT+CIPOPEN?", "+CIPOPEN: " + curLocChannel + ",", TO_LOCAL)) {
-    ATCIPOPEN(curLocHost, curLocPort, curLocChannel);
-  }
-  if (!sendATincludes("AT+CIPOPEN?", "+CIPOPEN: " + oldLocChannel + ",", TO_LOCAL)) {
-    ATCIPOPEN(oldLocHost, oldLocPort, oldLocChannel);
-  }
-}
 
 bool getGPS(){
   gpsData = "";
@@ -628,20 +841,108 @@ void buildNmea(){
   csvToArray(gpsData, ',', gpsFields, 18);
 
   if (gpsFields[0] == "" || gpsFields[0] == "0" || gpsFields[5] == "" || gpsFields[7] == ""){
-    nmeaSentence = "$GNRMC,,V,,,,,,,,,,N,V,"; 
+    nmeaSentence = "$GPRMC,,V,,,,,,,,,,N,V"; 
   }
   else {
     String lat = ddToDegMin(gpsFields[5], true);
     String lon = ddToDegMin(gpsFields[7], false);
-    nmeaSentence = "$GNRMC," + gpsFields[10] + ",A," + lat + "," + gpsFields[6] + "," + 
+    nmeaSentence = "$GPRMC," + gpsFields[10] + ",A," + lat + "," + gpsFields[6] + "," + 
                   lon + "," + gpsFields[8] + "," + gpsFields[12] + "," + 
                   gpsFields[13] + "," + gpsFields[9] + ",,,A,V";
   }
   Serial.println(nmeaSentence);
 }
 
+String ddToDegMin(String dd_str, bool isLatitude) {
+  if (dd_str.length() == 0) return "";
+
+  double dd = dd_str.toFloat();
+  bool negative = dd < 0.0;
+  if (negative) dd = -dd;
+
+  int deg = (int)dd;
+  double frac = dd - (double)deg;
+  double minutes = frac * 60.0;
+
+  long minFrac = (long)round((minutes - floor(minutes)) * 10000.0);
+  int minWhole = (int)floor(minutes);
+  if (minFrac >= 10000) {
+    minFrac = 0;
+    minWhole += 1;
+    if (minWhole >= 60) {
+      minWhole = 0;
+      deg += 1;
+    }
+  }
+
+  char buf[20];
+  if (isLatitude) {
+    sprintf(buf, "%02d%02d.%04ld", deg, minWhole, minFrac);
+  } else {
+    sprintf(buf, "%03d%02d.%04ld", deg, minWhole, minFrac);
+  }
+
+  return String(buf);
+}
+
+double calculateFlatDistance(double lat1, double lon1, double lat2, double lon2) {
+  double latMid = (lat1 + lat2) * 0.017453292519943295 / 2.0; 
+  double m_per_deg_lat = 111132.954 - 559.822 * cos(2 * latMid) + 1.175 * cos(4 * latMid);
+  double m_per_deg_lon = 111412.84 * cos(latMid) - 93.5 * cos(3 * latMid);
+
+  double deltaLat = (lat1 - lat2) * m_per_deg_lat;
+  double deltaLon = (lon1 - lon2) * m_per_deg_lon;
+
+  return sqrt(deltaLat * deltaLat + deltaLon * deltaLon); 
+}
+
+double distanceMeters(double lat1_dm, double lon1_dm, double lat2_dm, double lon2_dm) {
+  auto dmToDec = [](double dm)->double {
+    int deg = (int)(dm / 100.0);
+    double minutes = dm - (double)deg * 100.0;
+    return (double)deg + (minutes / 60.0);
+  };
+
+  double lat1 = dmToDec(lat1_dm);
+  double lon1 = dmToDec(lon1_dm);
+  double lat2 = dmToDec(lat2_dm);
+  double lon2 = dmToDec(lon2_dm);
+
+  return calculateFlatDistance(lat1, lon1, lat2, lon2);
+}
+
+int csvToArray(String data, char separator, String* arrayOut, int maxItems) {
+  int arrayIndex = 0;
+  int fromIndex = 0;
+  int sepIndex = 0;
+
+  while ((sepIndex = data.indexOf(separator, fromIndex)) != -1 && arrayIndex < maxItems - 1) {
+    arrayOut[arrayIndex++] = data.substring(fromIndex, sepIndex);
+    fromIndex = sepIndex + 1;
+  }
+  if (arrayIndex < maxItems) {
+    arrayOut[arrayIndex++] = data.substring(fromIndex);
+  }
+  return arrayIndex; 
+}
+
+String addChecksum(String sentence) {
+    int check = 0;
+    int startIndex = (sentence.charAt(0) == '$') ? 1 : 0;
+    
+    for (int i = startIndex; i < sentence.length(); i++) {
+        check ^= sentence.charAt(i);
+    }
+    
+    String hexCheck = String(check, HEX);
+    hexCheck.toUpperCase();
+    if (hexCheck.length() < 2) hexCheck = "0" + hexCheck;
+    
+    return sentence + "*" + hexCheck;
+}
+
 void addNmeaToArray() {
-  if (nmeaIndex >= NMEA_MAX_LENGTH) return;
+  if (nmeaIndex >= NMEA_ARRAY_LENGTH) return;
 
   if (nmeaIndex != 0) {
     if (!(gpsFields[12].toDouble() > THRESH_SPEED)) return;
@@ -750,11 +1051,25 @@ bool CIPSEND(String payload, String channel){
     yield();
   }
   
-  if (channel == oldLocChannel && serverResponse.indexOf("Insertado con identificador") == -1) {
+  if (channel == locChannel && serverResponse.indexOf("Insertado con identificador") == -1) {
     return false; 
   }
 
   return dataSent;
+}
+
+void sendNmeaSentence(){
+  String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
+  if(!CIPSEND(payload, locChannel)){
+    addNmeaToArray();
+    addError(ERR_SOCKET_MSG_FAILURE);
+  }
+  else{
+    if (nmeaIndex > 0) {
+      startSocket();
+      sendOldNmeaToSocket();
+    }
+  }
 }
 
 void sendOldNmeaToSocket(){
@@ -764,7 +1079,7 @@ void sendOldNmeaToSocket(){
   String json = "[";
   for (int i = 0; i < itemsToSend; i++) {
     if (nmeaArray[i] != "") {
-      json += "{" + addChecksum(nmeaArray[i]).substring(1) + "\r\n},";
+      json += "{" + addChecksum(nmeaArray[i]) + "},";
     }
   }
 
@@ -775,7 +1090,7 @@ void sendOldNmeaToSocket(){
 
   String payload = ">IH=" + DEVICE_ID + "," + json + "<\r\n";
 
-  if (CIPSEND(payload, oldLocChannel)) {    
+  if (CIPSEND(payload, locChannel)) {    
     for (int i = 0; i < itemsToSend; i++) {
       nmeaArray[i] = ""; 
     }
