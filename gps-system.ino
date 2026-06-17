@@ -1,3 +1,4 @@
+//import libraries
 #include  <Arduino.h>
 #include <Update.h>
 #include <Preferences.h>
@@ -6,7 +7,7 @@
 #define RX2 16
 #define TX2 17
 
-//every week? send the error messages as part of the overnight
+//Error Logs
 #define ERR_AT_TIMEOUT 100
 #define ERR_AT_FAILURE 101
 #define ERR_GPS_INIT 200
@@ -35,22 +36,22 @@ int errorIndex = 0;
 
 //define constants
 const String APN = "fast.t-mobile.com";
-const String HOST = "www.botech.com.co";
-const String PORT = "9504";
-const String PATH = "/";
 String DEVICE_ID = "000";
 
 //CHANGE THIS EVERY UPDATE!!
 const int LOCAL_VERSION = 0;
 
-// Your exact Dropbox asset links (configured to force direct raw downloads)
+//https://dl.dropboxusercontent.com/scl/fi/.../<filename>?rlkey=...&st=...&dl=1
 String version_url = "https://dl.dropboxusercontent.com/scl/fi/r0rhfi73h7iciwrlumrls/version.txt?rlkey=ddjovrejh5wg06vr26z63uvmu&st=9zyuv7eo&dl=1";
 String firmware_url = "https://dl.dropboxusercontent.com/scl/fi/1x22iaxccj0rqc2e2tuvf/test-gps-code.ino.bin?rlkey=eh8112jyw16821s8k884o9d76&st=u3ulhjbe&dl=1";
 
-
+const String curLocHost = "www.botech.com.co";
+const String curLocPort = "9504";
+const String oldLocHost = "dev.botech.com.co";
+const String oldLocPort = "9504";
+const String DEVICE_ID = "189";
 const int GPS_INTERVAL = 10; // tracking interval in seconds
 const int NMEA_MAX_LENGTH = 82;
-const int GPS_DATA_ARRAY_SIZE = 1500;
 const int PACKAGE_SIZE = 100;
 
 const int THRESH_SPEED = 13; //in knots
@@ -61,7 +62,7 @@ const String UPDATE_TIME_UTC = "000000.00"; //hhmmss.ss, set to 2am COT
 
 const unsigned long TO_LOCAL = 2000;
 const unsigned long TO_CELL = 10000;
-const unsigned long TO_SOCKET = 30000;
+const unsigned long TO_SOCKET = 10000;
 
 //global variables
 unsigned long lastUpdate;
@@ -69,23 +70,28 @@ unsigned long gpsStartTime;
 String gpsData;
 String gpsFields[18];
 String nmeaSentence;
-char nmeaArray[NMEA_MAX_LENGTH][GPS_DATA_ARRAY_SIZE];
+String nmeaArray[NMEA_MAX_LENGTH];
 int nmeaIndex = 0;
 bool otaExecutedToday = false; // Prevents re-trigger loop
 String dateLastUpdated = "000000"; // ddmmyy, change this when you update
 int serverVersion = 0;
 int firmwareSize = 0; // Will be parsed dynamically from version.txt
+int failuresToSend = 0;
+String curLocChannel = "0";
+String oldLocChannel = "1";
 
 //function headers
 void stop();
 void addError(int code);
 void waitForResponse();
 String ddToDegMin(String dd_str, bool isLatitude);
-double distanceMeters(double lat1, double lon1, double lat2, double lon2);
-int gpsDataToArray(String data, char separator, String* arrayOut, int maxItems);
+double calculateFlatDistance(double lat1, double lon1, double lat2, double lon2);
+double distanceMeters(double lat1_dm, double lon1_dm, double lat2_dm, double lon2_dm);
+int csvToArray(String data, char separator, String* arrayOut, int maxItems);
 String addChecksum(String sentence);
 bool ATNETOPEN();
-bool ATCIPOPEN();
+bool ATNETCLOSE();
+bool ATCIPOPEN(String host, String port, String channel);
 String sendAT(String msg, unsigned long timeout);
 bool sendATincludes(String msg, String inclusion, unsigned long timeout);
 void setupGPS();
@@ -93,9 +99,11 @@ void setupPDP();
 void fixLocation();
 void startSocket();
 bool getGPS();
-bool sendNmeaToSocket();
+bool CIPSEND(String payload, String channel);
+void addNmeaToArray();
 void buildNmea();
-
+void sendOldNmeaToSocket();
+bool isSocketConnected(String channel);
 
 void setup() {
   delay(3000);
@@ -140,34 +148,42 @@ void setup() {
   lastUpdate = millis();
 }
 
-String getTime() {
-  if (getGPS()) {
-    if (gpsFields[10].length() >= 6) {
-      return gpsFields[10].substring(0, 6); 
-    }
-  }
-  return "000000";
-}
-
-String getDate() {
-  if(getGPS()){
-    if (gpsFields[9].length() >= 2) {
-      return gpsFields[9].substring(0, 2);
-    }
-  }
-  return "00";
-}
-
 void loop() {
-  // if (millis() - lastUpdate >= (GPS_INTERVAL * 1000)){
-  //   lastUpdate = millis();
-  //   if (getGPS()){
-  //     startSocket();
-  //     if(!sendNmeaToSocket()){
-  //       addError(ERR_SOCKET_MSG_FAILURE);
-  //     }
-  //   }
-  // }
+  if (millis() - lastUpdate >= (GPS_INTERVAL * 1000)){
+    lastUpdate = millis();
+    if (getGPS()){
+      startSocket(); 
+      
+      String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
+      if(!CIPSEND(payload, curLocChannel)){
+        failuresToSend++;
+        addNmeaToArray();
+        addError(ERR_SOCKET_MSG_FAILURE);
+      }
+      else{
+        failuresToSend = 0;
+        if (nmeaIndex > 0) {
+          sendOldNmeaToSocket();
+        }
+      }
+    }
+    
+    if (failuresToSend >= 3){
+      if (!sendATincludes("AT+CEREG?", "+CEREG: 0,1", TO_CELL)){
+        addError(ERR_NET_REGISTRATION);
+        sendAT("AT+COPS=2", TO_CELL);
+        sendAT("AT+COPS=0", TO_CELL);
+        
+        unsigned long regStart = millis();
+        while(millis() - regStart < 15000) {
+          if (sendATincludes("AT+CEREG?", "+CEREG: 0,1", TO_CELL)) break;
+          delay(1000);
+        }
+      }
+      else{
+        startSocket(); 
+      }
+      failuresToSend = 0;
   delay(10000);
   String curTime = getTime();
   Serial.println("curTime"+curTime);
@@ -429,15 +445,30 @@ void downloadNewVersion() {
 
 
 //helper functions
+
+String getTime() {
+  if (getGPS()) {
+    if (gpsFields[10].length() >= 6) {
+      return gpsFields[10].substring(0, 6); 
+    }
+  }
+  return "000000";
+}
+
+String getDate() {
+  if(getGPS()){
+    if (gpsFields[9].length() >= 2) {
+      return gpsFields[9].substring(0, 2);
+    }
+  }
+  return "00";
+}
+    
 void stop() {
   for (int i = 0; i < errorIndex; i++) {
     Serial.println(errorLog[i]);
   }
-
-  Serial.println("going into deep sleep");
-  while (true){
-    yield();
-  }
+  ESP.restart();
 }
 
 void addError(int code) {
@@ -456,31 +487,68 @@ void waitForResponse(){
   }
 }
 
-// Convert decimal degrees in string form (dd.dddd or -dd.dddd) to NMEA degrees-minutes format:
-// latitude: ddmm.mmmm (2-digit degrees), longitude: dddmm.mmmm (3-digit degrees)
 String ddToDegMin(String dd_str, bool isLatitude) {
   if (dd_str.length() == 0) return "";
 
   double dd = dd_str.toFloat();
-  bool negative = dd < 0;
+  bool negative = dd < 0.0;
   if (negative) dd = -dd;
 
   int deg = (int)dd;
-  double frac = dd - deg;
+  double frac = dd - (double)deg;
   double minutes = frac * 60.0;
 
-  char buf[16];
-  if (isLatitude) {
-    sprintf(buf, "%02d%07.4f", deg, minutes);
-  } else {
-    sprintf(buf, "%03d%07.4f", deg, minutes);
+  // handle rounding that would push minutes to 60.0000
+  long minFrac = (long)round((minutes - floor(minutes)) * 10000.0);
+  int minWhole = (int)floor(minutes);
+  if (minFrac >= 10000) {
+    minFrac = 0;
+    minWhole += 1;
+    if (minWhole >= 60) {
+      minWhole = 0;
+      deg += 1;
+    }
   }
 
-  String out = String(buf);
-  return out;
+  char buf[20];
+  if (isLatitude) {
+    // degrees: 2 digits, minutes: 2 digits + '.' + 4 decimals
+    sprintf(buf, "%02d%02d.%04ld", deg, minWhole, minFrac);
+  } else {
+    // degrees: 3 digits
+    sprintf(buf, "%03d%02d.%04ld", deg, minWhole, minFrac);
+  }
+
+  return String(buf);
 }
 
-int gpsDataToArray(String data, char separator, String* arrayOut, int maxItems) {
+double calculateFlatDistance(double lat1, double lon1, double lat2, double lon2) {
+  double latMid = (lat1 + lat2) * 0.017453292519943295 / 2.0; 
+  double m_per_deg_lat = 111132.954 - 559.822 * cos(2 * latMid) + 1.175 * cos(4 * latMid);
+  double m_per_deg_lon = 111412.84 * cos(latMid) - 93.5 * cos(3 * latMid);
+
+  double deltaLat = (lat1 - lat2) * m_per_deg_lat;
+  double deltaLon = (lon1 - lon2) * m_per_deg_lon;
+
+  return sqrt(deltaLat * deltaLat + deltaLon * deltaLon); 
+}
+
+double distanceMeters(double lat1_dm, double lon1_dm, double lat2_dm, double lon2_dm) {
+  auto dmToDec = [](double dm)->double {
+    int deg = (int)(dm / 100.0);
+    double minutes = dm - (double)deg * 100.0;
+    return (double)deg + (minutes / 60.0);
+  };
+
+  double lat1 = dmToDec(lat1_dm);
+  double lon1 = dmToDec(lon1_dm);
+  double lat2 = dmToDec(lat2_dm);
+  double lon2 = dmToDec(lon2_dm);
+
+  return calculateFlatDistance(lat1, lon1, lat2, lon2);
+}
+
+int csvToArray(String data, char separator, String* arrayOut, int maxItems) {
   int arrayIndex = 0;
   int fromIndex = 0;
   int sepIndex = 0;
@@ -531,14 +599,12 @@ bool ATNETOPEN(){
                 return true;
               }
               retry = true;
-              //otherwise there was some error, try again
               break;
             }
             if (curLine.indexOf("ERROR")!=-1){
               retry = true;
               break;
             }
-
           }
           curLine = "";
         }
@@ -547,9 +613,7 @@ bool ATNETOPEN(){
         }
       }
       yield();
-      if (retry){
-        break;
-      }
+      if (retry) break;
       delay(1);
     }
     addError(ERR_NET_OPEN);
@@ -562,14 +626,12 @@ bool ATNETOPEN(){
 bool ATNETCLOSE(){
   unsigned long timeout = TO_SOCKET;
   for (int tries = 0; tries<4; tries++) {
-
     while(Serial2.available()){
       Serial.write(Serial2.read()); 
     }
 
     bool retry = false;
     String curLine = "";
-
     Serial2.println("AT+NETCLOSE");
 
     unsigned long start = millis();
@@ -580,23 +642,13 @@ bool ATNETCLOSE(){
         if (c == '\n') {
           curLine.trim();
           if (curLine.length() > 0) {
-            if (curLine.indexOf("OK")!=-1){
-              while(Serial2.available()){
-                Serial.write(Serial2.read());
-              }
-              return true;
-            }
             if (curLine.indexOf("OK")!=-1 || curLine.indexOf("+NETCLOSE: 2")!=-1 || curLine.indexOf("+NETCLOSE: 0")!=-1){
-              while(Serial2.available()){
-                Serial.write(Serial2.read());
-              }
               return true;
             }
             if (curLine.indexOf("ERROR")!=-1){
               retry = true;
               break;
             }
-
           }
           curLine = "";
         }
@@ -605,9 +657,7 @@ bool ATNETCLOSE(){
         }
       }
       yield();
-      if (retry){
-        break;
-      }
+      if (retry) break;
       waitForResponse();
     }
     addError(ERR_NET_CLOSE);
@@ -617,10 +667,9 @@ bool ATNETCLOSE(){
   return false;
 }
 
-bool ATCIPOPEN(){
+bool ATCIPOPEN(String host, String port, String channel){
   unsigned long timeout = TO_SOCKET;
   for (int tries = 0; tries<4; tries++) {
-
     while(Serial2.available()){
       Serial.write(Serial2.read());
     }
@@ -628,7 +677,7 @@ bool ATCIPOPEN(){
     bool retry = false;
     String curLine = "";
 
-    String cmd = "AT+CIPOPEN=0,\"TCP\",\"" + HOST + "\"," + PORT;
+    String cmd = "AT+CIPOPEN=" + channel + ",\"TCP\",\"" + host + "\"," + port;
     Serial2.println(cmd);
 
     unsigned long start = millis();
@@ -640,7 +689,7 @@ bool ATCIPOPEN(){
           curLine.trim();
           if (curLine.length() > 0) {
             if (curLine.indexOf("+CIPOPEN:")!=-1){
-              if(curLine.indexOf("+CIPOPEN: 0,0")!=-1){
+              if(curLine.indexOf("+CIPOPEN: " + channel + ",0")!=-1 || curLine.indexOf("+CIPOPEN: " + channel + ",4")!=-1){
                 return true;
               }
               retry = true;
@@ -650,7 +699,6 @@ bool ATCIPOPEN(){
               retry = true;
               break;
             }
-
           }
           curLine = "";
         }
@@ -659,14 +707,11 @@ bool ATCIPOPEN(){
         }
       }
       yield();
-      if (retry){
-        break;
-      }
+      if (retry) break;
       waitForResponse();
     }
     addError(ERR_INIT_SOCKET_CONNECTION);
-    sendAT("AT+CIPCLOSE=0", TO_LOCAL);
-    setupPDP();
+    sendAT("AT+CIPCLOSE=" + channel, TO_LOCAL);
     delay(500);
   }
   addError(ERR_AT_FAILURE);
@@ -753,12 +798,8 @@ String sendAT(String msg, unsigned long timeout) {
           curLine.trim();
           if (curLine.length() > 0) {
             out += curLine + "\n";
-            if (curLine.indexOf("OK") != -1) {
-              return out;
-            }
-            if (curLine.indexOf("ERROR") != -1) {
-              return out;
-            }
+            if (curLine.indexOf("OK") != -1) return out;
+            if (curLine.indexOf("ERROR") != -1) return out;
           }
           curLine = "";
         }
@@ -784,38 +825,25 @@ bool sendATincludes(String msg, String inclusion, unsigned long timeout){
 void setupGPS(){
   sendAT("AT+CGNSSPWR=0", TO_LOCAL);
   delay(500);
-
-  Serial2.println("AT+CGNSSPWR=1");
-  unsigned long start = millis();
-  bool ready = false;
-  String curLine = "";
-  while (millis() - start < 10000){
-    while (Serial2.available()){
-      char c = Serial2.read();
-      Serial.write(c);
-      if (c == '\n'){
-        curLine.trim();
-        if (curLine.indexOf("OK") != -1){
-          ready = true;
-          break;
-        }
-        curLine = "";
-      } else if (c != '\r') curLine += c;
+  if (!sendATincludes("AT+CGNSSPWR=1", "OK", 10000)){
+    if (sendATincludes("AT+CFUN?", "1", 1000)){
+      addError(ERR_GPS_INIT);
+      stop();
     }
-    if (ready) break;
-    yield();
+    else if (sendATincludes("AT+CFUN=1", "ERROR", TO_LOCAL)){
+        addError(ERR_GPS_INIT);
+        stop();
+    }
+    sendAT("AT+CGNSSPWR=0", TO_LOCAL);
+    delay(500);
+    if (!(sendATincludes("AT+CGNSSPWR=1", "OK", 10000))){
+      addError(ERR_GPS_INIT);
+      stop();
+    }
   }
-
-  if (!ready){
-    addError(ERR_GPS_INIT);
-    stop();
-  }
-
-  gpsStartTime = millis();
 }
 
 void setupPDP(){
-
   if (sendATincludes("AT+CEREG=1", "ERROR", TO_CELL)){
     addError(ERR_NET_REGISTRATION);
     stop();
@@ -836,7 +864,10 @@ void setupPDP(){
 
   if (!sendATincludes("AT+NETOPEN?", "+NETOPEN: 1", TO_CELL)){
     if (!ATNETOPEN()){
-      stop();
+      ATNETCLOSE();
+      if(!ATNETOPEN()){
+        stop();
+      }
     }
   }
 
@@ -845,7 +876,7 @@ void setupPDP(){
    addError(ERR_NET_IP);
    stop();
   }
-
+  //may not be needed
   sendAT("AT+CGSOCKCONT=1,\"IP\",\"" + APN + "\"", TO_CELL);
   
 }
@@ -869,17 +900,17 @@ void fixLocation(){
 }
 
 void startSocket(){
-  sendAT("AT+CIPCLOSE=0", TO_LOCAL);
-  delay(100);
-  if (!ATCIPOPEN()){
-    stop();
+  if (!sendATincludes("AT+CIPOPEN?", "+CIPOPEN: " + curLocChannel + ",", TO_LOCAL)) {
+    ATCIPOPEN(curLocHost, curLocPort, curLocChannel);
+  }
+  if (!sendATincludes("AT+CIPOPEN?", "+CIPOPEN: " + oldLocChannel + ",", TO_LOCAL)) {
+    ATCIPOPEN(oldLocHost, oldLocPort, oldLocChannel);
   }
 }
 
 bool getGPS(){
   gpsData = "";
   Serial2.println("AT+CGNSSINFO");
-
   waitForResponse();
   
   String curLine = "";
@@ -909,8 +940,7 @@ bool getGPS(){
 }
 
 void buildNmea(){
-
-  gpsDataToArray(gpsData, ',', gpsFields, 18);
+  csvToArray(gpsData, ',', gpsFields, 18);
 
   if (gpsFields[0] == "" || gpsFields[0] == "0" || gpsFields[5] == "" || gpsFields[7] == ""){
     nmeaSentence = "$GNRMC,,V,,,,,,,,,,N,V"; 
@@ -925,15 +955,46 @@ void buildNmea(){
   Serial.println(nmeaSentence);
 }
 
-bool sendNmeaToSocket(){
+void addNmeaToArray() {
+  if (nmeaIndex >= NMEA_MAX_LENGTH) return;
+
+  if (nmeaIndex != 0) {
+    if (!(gpsFields[12].toDouble() > THRESH_SPEED)) return;
+
+    String lastNmea = nmeaArray[nmeaIndex-1];
+    String lastNmeaArray[14];
+    csvToArray(lastNmea, ',', lastNmeaArray, 14);
+
+    String curNmeaArray[14];
+    csvToArray(nmeaSentence, ',', curNmeaArray, 14);
+
+    double lastLat = lastNmeaArray[3].toDouble();
+    if (lastNmeaArray[4] == "S") lastLat = -lastLat;
+    double lastLon = lastNmeaArray[5].toDouble();
+    if (lastNmeaArray[6] == "W") lastLon = -lastLon;
+    double lastDegrees = lastNmeaArray[8].toDouble();
+
+    double curLat = curNmeaArray[3].toDouble();
+    if (curNmeaArray[4] == "S") curLat = -curLat;
+    double curLon = curNmeaArray[5].toDouble();
+    if (curNmeaArray[6] == "W") curLon = -curLon;
+    double curDegrees = curNmeaArray[8].toDouble();
+
+    if (!(distanceMeters(lastLat, lastLon, curLat, curLon) > THRESH_DIST)) return;
+    if (!(abs(curDegrees - lastDegrees) > THRESH_BEARING)) return;
+  }
+
+  nmeaArray[nmeaIndex++] = nmeaSentence;
+  Serial.print("Saved offline point. Current index: ");
+  Serial.println(nmeaIndex);
+}
+
+bool CIPSEND(String payload, String channel){
   while (Serial2.available()){
     Serial.write(Serial2.read()); 
-  } 
+  }   
   
-
-  String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
-  
-  String sendCmd = "AT+CIPSEND=0," + String(payload.length());
+  String sendCmd = "AT+CIPSEND=" + channel + "," + String(payload.length());
   unsigned long startAll = millis();
   int tries = 0;
   bool dataSent = false;
@@ -944,15 +1005,26 @@ bool sendNmeaToSocket(){
     }
     Serial2.println(sendCmd);
     String curLine = "";
-    while ((millis() - startAll) < TO_SOCKET) {
+    while ((millis() - startAll) < TO_SOCKET/3) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
         Serial.write(c);
+
         if (c == '>') {
           Serial2.print(payload);
           dataSent = true;
           curLine = "";
           break;
+        }
+        else if (c == '\n') {
+          curLine.trim();
+          if (curLine.length() > 0 && curLine.indexOf("+CIPERROR:") != -1) {
+              break;
+          }
+          curLine = "";
+        }
+        else if (c != '\r') {
+          curLine += c;
         }
       }
       if (dataSent) break;
@@ -960,7 +1032,7 @@ bool sendNmeaToSocket(){
     }
 
     if (!dataSent) {
-      sendAT("AT+CIPCLOSE=0", TO_LOCAL);
+      sendAT("AT+CIPCLOSE=" + channel, TO_LOCAL); 
       tries++;
       delay(200);
     }
@@ -968,14 +1040,18 @@ bool sendNmeaToSocket(){
 
   String curLine = "";
   bool remoteClosed = false;
-  while ((millis() - startAll) < TO_SOCKET) {
+  unsigned long waitAckStart = millis();
+  String serverResponse = ""; 
+
+  while ((millis() - waitAckStart) < 5000) { 
     while (Serial2.available() > 0) {
       char c = Serial2.read();
       Serial.write(c);
       if (c == '\n') {
         curLine.trim();
         if (curLine.length() > 0) {
-          if (curLine.indexOf("+IPCLOSE: 0,1") != -1) {
+          serverResponse += curLine + "\n";
+          if (curLine.indexOf("+IPCLOSE: " + channel + ",1") != -1) {
             remoteClosed = true;
             break;
           }
@@ -988,6 +1064,47 @@ bool sendNmeaToSocket(){
     if (remoteClosed) break;
     yield();
   }
+  
+  if (channel == oldLocChannel && serverResponse.indexOf("Insertado con identificador") == -1) {
+    return false; 
+  }
 
-  return remoteClosed;
+  return dataSent;
+}
+
+void sendOldNmeaToSocket(){
+  int itemsToSend = (nmeaIndex < PACKAGE_SIZE) ? nmeaIndex : PACKAGE_SIZE;
+  if (itemsToSend == 0) return; 
+
+  String json = "[";
+  for (int i = 0; i < itemsToSend; i++) {
+    if (nmeaArray[i] != "") {
+      json += "{" + addChecksum(nmeaArray[i]).substring(1) + "\r\n},";
+    }
+  }
+
+  if (json.endsWith(",")) {
+    json.remove(json.length() - 1);
+  }
+  json += "]";
+
+  String payload = ">IH=" + DEVICE_ID + "," + json + "<\r\n";
+
+  if (CIPSEND(payload, oldLocChannel)) {    
+    for (int i = 0; i < itemsToSend; i++) {
+      nmeaArray[i] = ""; 
+    }
+
+    int writeIndex = 0;
+    for (int i = 0; i < nmeaIndex; i++) {
+      if (nmeaArray[i] != "") {
+        if (writeIndex != i) {
+          nmeaArray[writeIndex] = nmeaArray[i];
+          nmeaArray[i] = ""; 
+        }
+        writeIndex++;
+      }
+    }    
+    nmeaIndex = writeIndex;
+  }
 }
