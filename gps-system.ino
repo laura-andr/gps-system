@@ -45,10 +45,8 @@ const int LOCAL_VERSION = 0;
 String version_url = "https://dl.dropboxusercontent.com/scl/fi/r0rhfi73h7iciwrlumrls/version.txt?rlkey=ddjovrejh5wg06vr26z63uvmu&st=9zyuv7eo&dl=1";
 String firmware_url = "https://dl.dropboxusercontent.com/scl/fi/1x22iaxccj0rqc2e2tuvf/test-gps-code.ino.bin?rlkey=eh8112jyw16821s8k884o9d76&st=u3ulhjbe&dl=1";
 
-const String curLocHost = "www.botech.com.co";
-const String curLocPort = "9504";
-const String oldLocHost = "dev.botech.com.co";
-const String oldLocPort = "9504";
+const String locHost = "dev.botech.com.co";
+const String locPort = "9504";
 const String DEVICE_ID = "189";
 const int GPS_INTERVAL = 10; // tracking interval in seconds
 const int NMEA_MAX_LENGTH = 82;
@@ -77,8 +75,7 @@ String dateLastUpdated = "000000"; // ddmmyy, change this when you update
 int serverVersion = 0;
 int firmwareSize = 0; // Will be parsed dynamically from version.txt
 int failuresToSend = 0;
-String curLocChannel = "0";
-String oldLocChannel = "1";
+String locChannel = "0";
 
 //function headers
 void stop();
@@ -131,12 +128,7 @@ void setup() {
 
   delay(1000);
 
-  Serial2.println("AT");
-  delay(500);
-
-  while(Serial2.available()){
-    Serial.write(Serial2.read());
-  }
+  sendAT("AT?", TO_LOCAL);
   delay(1000);
   sendAT("AT+IPR=115200", TO_LOCAL);
   delay(1000);
@@ -155,45 +147,24 @@ void loop() {
       startSocket(); 
       
       String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
-      if(!CIPSEND(payload, curLocChannel)){
-        failuresToSend++;
+      if(!CIPSEND(payload, locChannel)){
         addNmeaToArray();
         addError(ERR_SOCKET_MSG_FAILURE);
       }
       else{
-        failuresToSend = 0;
         if (nmeaIndex > 0) {
+          startSocket();
           sendOldNmeaToSocket();
         }
       }
     }
-    
-    if (failuresToSend >= 3){
-      if (!sendATincludes("AT+CEREG?", "+CEREG: 0,1", TO_CELL)){
-        addError(ERR_NET_REGISTRATION);
-        sendAT("AT+COPS=2", TO_CELL);
-        sendAT("AT+COPS=0", TO_CELL);
-        
-        unsigned long regStart = millis();
-        while(millis() - regStart < 15000) {
-          if (sendATincludes("AT+CEREG?", "+CEREG: 0,1", TO_CELL)) break;
-          delay(1000);
-        }
+    String curTime = getTime();
+    if (curTime >= UPDATE_TIME_UTC) {
+      sendAT("AT+CIPCLOSE=0", TO_LOCAL);
+      String curDate = getDate();
+      if (dateLastUpdated != curDate) {
+        downloadNewVersion();
       }
-      else{
-        startSocket(); 
-      }
-      failuresToSend = 0;
-  delay(10000);
-  String curTime = getTime();
-  Serial.println("curTime"+curTime);
-  if (curTime >= UPDATE_TIME_UTC) {
-    sendAT("AT+CIPCLOSE=0", TO_LOCAL);
-    String curDate = getDate();
-    Serial.println("lastUpdate:"+dateLastUpdated);
-    Serial.println("curDate:"+curDate);
-    if (dateLastUpdated != curDate) {
-      downloadNewVersion();
     }
   }
 }
@@ -202,11 +173,9 @@ long httpGET(String url) {
   int tries = 0;
 
   while (tries < 3){
-    // 1. Clear out active or hung sessions first
     sendAT("AT+HTTPTERM", TO_CELL); 
     delay(100);
     
-    // 2. Initialize the HTTP client application
     if (!sendATincludes("AT+HTTPINIT", "OK", TO_CELL)){
       addError(ERR_HTTP_INIT_FAILURE);
       tries++;
@@ -214,15 +183,11 @@ long httpGET(String url) {
       continue;
     } 
 
-    // 3. Configure internal SSL Engine for Dropbox (Context 0)
     sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); // Force TLS 1.2 explicitly
     sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   // Bypass strict certificate authority checks
-    sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);  // Enable Server Name Indication
-    
-    // NEW CRITICAL LINE FOR DROPBOX SECURE HANDSHAKES:
+    sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);  // Enable Server Name Indication    
     sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL); // Enable ALL cipher suites supported by the modem
     
-    // 4. Bind the target URL string
     if (!sendATincludes("AT+HTTPPARA=\"URL\",\"" + url + "\"", "OK", TO_CELL)){
       addError(ERR_HTTP_GET_FAILURE);
       sendAT("AT+HTTPTERM", TO_CELL);
@@ -231,10 +196,8 @@ long httpGET(String url) {
       continue;
     } 
     
-    // 5. Fire asynchronous GET request
     Serial2.println("AT+HTTPACTION=0");
     
-    // 6. Asynchronous Listener Loop
     String actionResponse = "";
     unsigned long actionStart = millis();
     bool foundActionNotification = false;
@@ -242,7 +205,7 @@ long httpGET(String url) {
     while (millis() - actionStart < 20000) { 
       while (Serial2.available() > 0) {
         char c = Serial2.read();
-        Serial.write(c); // Mirror directly to hardware serial monitor
+        Serial.write(c); 
         actionResponse += c;
         
         if (actionResponse.indexOf("+HTTPACTION:") != -1 && actionResponse.endsWith("\n")) {
@@ -256,7 +219,6 @@ long httpGET(String url) {
     
     Serial.println("FULL ACTION RESP: [" + actionResponse + "]");
 
-    // 7. Evaluate the captured network status response
     int actionIdx = actionResponse.indexOf("+HTTPACTION:");
     if (actionIdx != -1) {
       int firstComma = actionResponse.indexOf(",", actionIdx);
@@ -267,7 +229,7 @@ long httpGET(String url) {
       if (status == "200") {
         String sizeStr = actionResponse.substring(secondComma + 1);
         sizeStr.trim();
-        return sizeStr.toInt(); // Returns file size
+        return sizeStr.toInt(); 
       } else {
         Serial.printf("\nDropbox Connection Rejected. Error Code: %s\n", status.c_str());
       }
@@ -284,7 +246,6 @@ long httpGET(String url) {
 int checkVersion() {
   Serial.println("\nChecking for available firmware updates...");
   
-  // 1. Fetch the exact metadata file size dynamically
   long metadataFileSize = httpGET(version_url); 
   if (metadataFileSize <= 0) {
     addError(ERR_VERSION_FILE_SIZE);
@@ -294,11 +255,9 @@ int checkVersion() {
   
   int tries = 0;
   while (tries < 3) {
-    // 2. Command the modem to pull down the ENTIRE metadata block payload safely
     String response = sendATHTTPREAD(String(metadataFileSize), TO_CELL);
     Serial.println("READRESPONSE"+response);
 
-    // 4. Split the text payload cleanly by its newline delimiter
     int newlineIdx = response.indexOf("\n");
     if (newlineIdx != -1) {
       String verStr = response.substring(0, newlineIdx);
@@ -400,7 +359,6 @@ void downloadNewVersion() {
       break;
     }
 
-    // Use sendATHTTPREAD to fetch the payload
     String payload = sendATHTTPREAD(String(targetBytesThisChunk), TO_CELL);
     if (payload.length() == 0) {
       Serial.println("Error: HTTPREAD returned no data.");
@@ -408,13 +366,11 @@ void downloadNewVersion() {
       return;
     }
 
-    // If module returned fewer bytes than requested, accept actual length
     int bytesToWrite = payload.length();
     if (bytesToWrite > (firmwareSize - currentPosition)) {
       bytesToWrite = firmwareSize - currentPosition;
     }
 
-    // Write payload into flash (safely, byte-by-byte)
     int bytesWritten = 0;
     for (int i = 0; i < bytesToWrite; i++) {
       uint8_t b = (uint8_t)payload.charAt(i);
@@ -431,7 +387,6 @@ void downloadNewVersion() {
     }
   }
 
-  // Finalize update
   if (Update.end() && Update.isFinished()) {
     Serial.println("\n[SUCCESS] Binary matches signature constraints! Rebooting...");
     sendAT("AT+HTTPTERM", TO_CELL);
@@ -844,7 +799,26 @@ void setupGPS(){
 }
 
 void setupPDP(){
-  if (sendATincludes("AT+CEREG=1", "ERROR", TO_CELL)){
+  bool recovered = true;
+  if (!sendATincludes("AT+CEREG?", ",1", TO_CELL) && !sendATincludes("AT+CEREG?", ",5", TO_CELL)) {  
+    sendAT("AT+COPS=2", TO_CELL); 
+    delay(1500);
+    sendAT("AT+COPS=0", TO_CELL); 
+    
+    unsigned long regStart = millis();
+    bool recovered = false;
+    
+    while (millis() - regStart < 15000) {
+      if (sendATincludes("AT+CEREG?", ",1", TO_CELL) || sendATincludes("AT+CEREG?", ",5", TO_CELL)) {
+        recovered = true;
+        break; 
+      }
+      delay(1000);
+      yield();
+    }
+  }
+
+  if (!recovered){
     addError(ERR_NET_REGISTRATION);
     stop();
   }
@@ -900,11 +874,15 @@ void fixLocation(){
 }
 
 void startSocket(){
-  if (!sendATincludes("AT+CIPOPEN?", "+CIPOPEN: " + curLocChannel + ",", TO_LOCAL)) {
-    ATCIPOPEN(curLocHost, curLocPort, curLocChannel);
+  String ipResponse = sendAT("AT+CGPADDR=1", TO_LOCAL);
+  if (ipResponse.indexOf("\"\"") != -1 || ipResponse.indexOf("ERROR") != -1 || ipResponse.indexOf("+CGPADDR:") == -1) {
+    sendAT("AT+NETCLOSE", TO_CELL);
+    delay(500);
+    setupPDP(); 
   }
-  if (!sendATincludes("AT+CIPOPEN?", "+CIPOPEN: " + oldLocChannel + ",", TO_LOCAL)) {
-    ATCIPOPEN(oldLocHost, oldLocPort, oldLocChannel);
+
+  if (!sendATincludes("AT+CIPOPEN?", "+CIPOPEN: " + locChannel + ",", TO_LOCAL)) {
+    ATCIPOPEN(locHost, locPort, locChannel);
   }
 }
 
