@@ -1079,7 +1079,7 @@ void sendOldNmeaToSocket(){
   String json = "[";
   for (int i = 0; i < itemsToSend; i++) {
     if (nmeaArray[i] != "") {
-      json += "{" + addChecksum(nmeaArray[i]).substring(1) + "\r\n},";
+      json += "{" + addChecksum(nmeaArray[i]) + "},";
     }
   }
 
