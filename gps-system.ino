@@ -41,7 +41,7 @@
 #define ERR_INSUFFICIENT_SPACE 505
 #define ERR_READ_UPDATE 506
 #define ERR_UPDATE_FAILURE 507
-#define ERR_LIGHTSLEEP 600
+#define ERR_SLEEP 600
 
 // begin define constants 
 
@@ -55,7 +55,7 @@ int lowVoltageCounter = 0;               // Replaces python 'low = 0'
 const String APN = "fast.t-mobile.com";
 
   // socket constants
-const String locHost = "dev.botech.com.co";
+const String locHost = "www.botech.com.co";
 const String locPort = "9504";
 const String locChannel = "0";
 
@@ -65,7 +65,6 @@ const String dateLastOTA = "000000";
 
   // ota update time
 const String UPDATE_TIME_UTC = "070000.00"; //hhmmss.ss
-const String MIDNIGHT_UTC = "050000.00";
 
   // ota urls https://dl.dropboxusercontent.com/scl/fi/.../<filename>?rlkey=...&st=...&dl=1
 const String version_url = "https://dl.dropboxusercontent.com/scl/fi/r0rhfi73h7iciwrlumrls/version.txt?rlkey=ddjovrejh5wg06vr26z63uvmu&st=9zyuv7eo&dl=1";
@@ -73,7 +72,8 @@ const String firmware_url = "https://dl.dropboxusercontent.com/scl/fi/1x22iaxccj
 
   // gps constant
 const int ACTIVE_GPS_INTERVAL = 10; // tracking interval in seconds
-const int IDLE_GPS_INTERVAL = 30*60; 
+const int IDLE_GPS_INTERVAL = 10*60; 
+RTC_DATA_ATTR int bootCount = 0;
 
   // send old location constants
 const int NMEA_ARRAY_LENGTH = 1500; // number old nmea sentences stored
@@ -158,6 +158,8 @@ float INA219_getPower_W();
 void checkPowerStatus();
 bool isActive();
 
+
+
 void setup() {
   delay(3000);
   Serial.begin(115200);
@@ -178,7 +180,9 @@ void setup() {
   
   setupGPS();
   setupPDP();
-  fixLocation();
+  if (isActive() || bootCount+1 == 3){
+    fixLocation();
+  }
   startSocket();
   setupSSL();
 
@@ -189,7 +193,6 @@ void setup() {
 void loop() {
   if (isActive()){
     if(millis() - lastLocUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
-      Serial.println("ACTIVE MODE");
       lastLocUpdate = millis();
       if (getGPS()){
         startSocket(); 
@@ -197,26 +200,21 @@ void loop() {
       }
     }
   } else {
-    Serial.println("IDLE MODE");
-    checkAndDoOTA();
-    sinceLastWakeup = millis() - lastLocUpdate;
-    lastLocUpdate = millis();    
-    uint64_t sleepMs = IDLE_GPS_INTERVAL * 1000;
-    if (sleepMs > sinceLastWakeup) {
-      sleepMs -= sinceLastWakeup;
-    }
-    uint64_t interval = sleepMs * 1000ULL;
-    sendAT("AT+CGPSHOT", TO_LOCAL);
-    fixLocation();
-    if (getGPS()){
-      startSocket();
-      sendNmeaSentence();
+    bootCount++;
+    if (bootCount == 3){
+      bootCount = 0;
+      checkAndDoOTA();
+      if(getGPS()){
+        startSocket();
+        sendNmeaSentence();
+      }
     }
     int count = 0;
     bool failed = false;
-    while (ESP_OK != esp_sleep_enable_timer_wakeup(interval)){
+    while (ESP_OK != esp_sleep_enable_timer_wakeup(IDLE_GPS_INTERVAL/3 * 1000000ULL)){
       if (count == 3){
-        addError(ERR_LIGHTSLEEP);
+        bootCount = 0;
+        addError(ERR_SLEEP);
         failed = true;
       }
       yield();
@@ -224,7 +222,7 @@ void loop() {
     }
     if (!failed){
       Serial.flush();
-      esp_light_sleep_start(); 
+      esp_deep_sleep_start(); 
     }
   }
 }
@@ -826,7 +824,7 @@ void downloadNewVersion() {
 
 void checkAndDoOTA(){
   String curTime = getTime();
-  if (curTime <= UPDATE_TIME_UTC && curTime >= MIDNIGHT_UTC) {
+  if (curTime <= UPDATE_TIME_UTC) {
     String curDate = getDate();
     if (dateLastOTA != curDate) {
       downloadNewVersion();
@@ -862,7 +860,7 @@ void fixLocation(){
     addError(ERR_GPS_INFO);
     stop();
   }
-  while (sendATincludes("AT+CGNSSINFO", ",,,,,", TO_LOCAL)){
+  while (sendATincludes("AT+CGNSSINFO", ",,,,,,,,", TO_LOCAL)){
     if (millis() - gpsStartTime > 480000){
       setupGPS();
       gpsStartTime = millis();
