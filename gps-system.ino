@@ -41,7 +41,7 @@
 #define ERR_INSUFFICIENT_SPACE 505
 #define ERR_READ_UPDATE 506
 #define ERR_UPDATE_FAILURE 507
-#define ERR_LIGHTSLEEP 600
+#define ERR_SLEEP 600
 
 // begin define constants 
 
@@ -64,14 +64,16 @@ const int LOCAL_VERSION = 0;
 const String dateLastOTA = "000000";
 
   // ota update time
-const String UPDATE_TIME_UTC = "070000.00"; //hhmmss.ss
+const String UPDATE_TIME_UTC = "050000.00"; //hhmmss.ss change back to 7
 
   // ota urls https://dl.dropboxusercontent.com/scl/fi/.../<filename>?rlkey=...&st=...&dl=1
 const String version_url = "https://dl.dropboxusercontent.com/scl/fi/r0rhfi73h7iciwrlumrls/version.txt?rlkey=ddjovrejh5wg06vr26z63uvmu&st=9zyuv7eo&dl=1";
 const String firmware_url = "https://dl.dropboxusercontent.com/scl/fi/1x22iaxccj0rqc2e2tuvf/firmware.ino.bin?rlkey=eh8112jyw16821s8k884o9d76&st=u3ulhjbe&dl=1";
 
   // gps constant
-const int GPS_INTERVAL = 10; // tracking interval in seconds
+const int ACTIVE_GPS_INTERVAL = 10; // tracking interval in seconds
+const int IDLE_GPS_INTERVAL = 2*60; 
+RTC_DATA_ATTR int bootCount = 0;
 
   // send old location constants
 const int NMEA_ARRAY_LENGTH = 1500; // number old nmea sentences stored
@@ -96,7 +98,6 @@ String DEVICE_ID = "000";
 
   // gps global variables
 unsigned long lastLocUpdate;
-unsigned long sinceLastWakeup;
 unsigned long gpsStartTime;
 String gpsData;
 String gpsFields[18];
@@ -112,6 +113,51 @@ int firmwareSize = 0;
   // error log global variables
 int errorLog[64];
 int errorIndex = 0;
+
+// function headers
+void stop();
+void addError(int code);
+void setupDeviceID();
+String getTime();
+String getDate();
+void setupPDP();
+void setupSSL();
+void startSocket();
+bool ATNETOPEN();
+bool ATNETCLOSE();
+bool ATCIPOPEN(String host, String port, String channel);
+String sendAT(String msg, unsigned long timeout);
+bool sendATincludes(String msg, String inclusion, unsigned long timeout);
+String sendATHTTPREAD(String numBytesToRead, unsigned long timeout);
+void waitForResponse();
+long httpGET(String url);
+int checkVersion();
+void downloadNewVersion();
+void checkAndDoOTA();
+void setupGPS();
+void fixLocation();
+bool getGPS();
+void buildNmea();
+String ddToDegMin(String dd_str, bool isLatitude);
+double calculateFlatDistance(double lat1, double lon1, double lat2, double lon2);
+double distanceMeters(double lat1_dm, double lon1_dm, double lat2_dm, double lon2_dm);
+int csvToArray(String data, char separator, String* arrayOut, int maxItems);
+String addChecksum(String sentence);
+void addNmeaToArray();
+bool CIPSEND(String payload, String channel);
+void sendNmeaSentence();
+void sendOldNmeaToSocket();
+void INA219_writeRegister(uint8_t reg, uint16_t value);
+uint16_t INA219_readRegister(uint8_t reg);
+void setupINA219();
+float INA219_getBusVoltage_V();
+float INA219_getShuntVoltage_mV();
+float INA219_getCurrent_mA();
+float INA219_getPower_W();
+void checkPowerStatus();
+bool isActive();
+
+
 
 void setup() {
   delay(3000);
@@ -131,26 +177,19 @@ void setup() {
   sendAT("AT+IPR=115200", TO_LOCAL);
   delay(1000);
   
-  setupGPS();
-  setupPDP();
-  fixLocation();
-  startSocket();
-  setupSSL();
+  if (isActive() || bootCount+1 == 2){
+    setupGPS();
+    setupPDP();
+    fixLocation();
+    startSocket();
+    setupSSL();
+  }
 
   lastLocUpdate = millis();
-  sinceLastWakeup = millis();
 }
-
 
 void loop() {
   if (isActive()){
-     if (millis() - lastLocUpdate >= (GPS_INTERVAL * 1000)){
-       checkPowerStatus();
-       lastLocUpdate = millis();
-       if (getGPS()){
-         startSocket(); 
-       }
-      }
     if(millis() - lastLocUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
       lastLocUpdate = millis();
       if (getGPS()){
@@ -159,26 +198,21 @@ void loop() {
       }
     }
   } else {
-    checkPowerStatus();
-    checkAndDoOTA();
-    sinceLastWakeup = millis() - lastLocUpdate;
-    lastLocUpdate = millis();    
-    uint64_t sleepMs = IDLE_GPS_INTERVAL * 1000;
-    if (sleepMs > sinceLastWakeup) {
-      sleepMs -= sinceLastWakeup;
-    }
-    uint64_t interval = sleepMs * 1000ULL;
-    sendAT("AT+CGPSHOT", TO_LOCAL);
-    fixLocation();
-    if (getGPS()){
-      startSocket();
-      sendNmeaSentence();
+    bootCount++;
+    if (bootCount == 2){
+      bootCount = 0;
+      if(getGPS()){
+        startSocket();
+        sendNmeaSentence();
+      }
+      checkAndDoOTA();
     }
     int count = 0;
     bool failed = false;
-    while (ESP_OK != esp_sleep_enable_timer_wakeup(interval)){
+    while (ESP_OK != esp_sleep_enable_timer_wakeup(IDLE_GPS_INTERVAL/2 * 1000000ULL)){
       if (count == 3){
-        addError(ERR_LIGHTSLEEP);
+        bootCount = 0;
+        addError(ERR_SLEEP);
         failed = true;
       }
       yield();
@@ -186,14 +220,25 @@ void loop() {
     }
     if (!failed){
       Serial.flush();
-      esp_light_sleep_start(); 
-
+      esp_deep_sleep_start(); 
+    }
+  }
 }
 
 //helper functions
 void stop() {
   for (int i = 0; i < errorIndex; i++) {
     Serial.println(errorLog[i]);
+  }
+  ESP.restart();
+}
+
+void addError(int code) {
+  if (errorIndex < 64) {
+    errorLog[errorIndex++] = code;
+  }
+}
+
 void setupDeviceID(){
   preferences.begin("storage", false);
 
@@ -209,17 +254,25 @@ void setupDeviceID(){
   preferences.end();
 }
 
-void setupSSL(){
-  sendAT("AT+HTTPTERM", TO_CELL);
-  delay(100);
-  sendAT("AT+HTTPINIT", TO_CELL);
-  delay(100);
-
-  sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); 
-  sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   
-  sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);  
-  sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL);
+String getTime() {
+  if (getGPS()) {
+    if (gpsFields[10].length() >= 6) {
+      return gpsFields[10].substring(0, 6); 
+    }
+  }
+  return "000000";
 }
+
+String getDate() {
+  if(getGPS()){
+    if (gpsFields[9].length() >= 2) {
+      return gpsFields[9].substring(0, 2);
+    }
+  }
+  return "00";
+}
+
+// --- Network / AT helpers ---
 
 void setupPDP(){
   bool recovered = true;
@@ -277,6 +330,18 @@ void setupPDP(){
   sendAT("AT+CGSOCKCONT=1,\"IP\",\"" + APN + "\"", TO_CELL);
 }
 
+void setupSSL(){
+  sendAT("AT+HTTPTERM", TO_CELL);
+  delay(100);
+  sendAT("AT+HTTPINIT", TO_CELL);
+  delay(100);
+
+  sendAT("AT+CSSLCFG=\"sslversion\",0,4", TO_LOCAL); 
+  sendAT("AT+CSSLCFG=\"authmode\",0,0", TO_LOCAL);   
+  sendAT("AT+CSSLCFG=\"enableSNI\",0,1", TO_LOCAL);  
+  sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL);
+}
+
 void startSocket(){
   String ipResponse = sendAT("AT+CGPADDR=1", TO_LOCAL);
   if (ipResponse.indexOf("\"\"") != -1 || ipResponse.indexOf("ERROR") != -1 || ipResponse.indexOf("+CGPADDR:") == -1) {
@@ -290,7 +355,6 @@ void startSocket(){
   }
 }
 
-// --- Network / AT helpers ---
 bool ATNETOPEN(){
   unsigned long timeout = TO_CELL;
   for (int tries = 0; tries<4; tries++) {
@@ -785,6 +849,7 @@ void setupGPS(){
       stop();
     }
   }
+  gpsStartTime = millis();
 }
 
 void fixLocation(){
@@ -793,7 +858,8 @@ void fixLocation(){
     addError(ERR_GPS_INFO);
     stop();
   }
-  while (sendATincludes("AT+CGNSSINFO", ",,,,,,,,", TO_LOCAL)){
+  while (sendATincludes("AT+CGNSSINFO", ",,,,", TO_LOCAL)){
+    Serial.println(millis() - gpsStartTime);
     if (millis() - gpsStartTime > 480000){
       setupGPS();
       gpsStartTime = millis();
