@@ -72,7 +72,7 @@ const String firmware_url = "https://dl.dropboxusercontent.com/scl/fi/1x22iaxccj
 
   // gps constant
 const int ACTIVE_GPS_INTERVAL = 10; // tracking interval in seconds
-const int IDLE_GPS_INTERVAL = 2*60; 
+const int IDLE_GPS_INTERVAL = 30*60; 
 RTC_DATA_ATTR int bootCount = 0;
 
   // send old location constants
@@ -117,7 +117,8 @@ int errorIndex = 0;
 // function headers
 void stop();
 void addError(int code);
-void setupDeviceID();
+void getDeviceID();
+void setDeviceID(String newID);
 String getTime();
 String getDate();
 void setupPDP();
@@ -169,7 +170,8 @@ void setup() {
   
   delay(1000);
   
-  setupDeviceID();
+  setDeviceID("189"); // DO THIS ONE TIME PER ESP 32 AND DELETE
+  getDeviceID();
   
   delay(1000);
   sendAT("AT", TO_LOCAL);
@@ -239,19 +241,28 @@ void addError(int code) {
   }
 }
 
-void setupDeviceID(){
-  preferences.begin("storage", false);
-
-  DEVICE_ID = preferences.getString("dev_id", "189");
-  
-  if (DEVICE_ID == "189" && !preferences.isKey("dev_id")) {
-    preferences.putString("dev_id", "189");
-  }
-  
-  Serial.print("\n[SYSTEM] Persistent Hardware Device ID Loaded: ");
-  Serial.println(DEVICE_ID);
+void getDeviceID() {
+  preferences.begin("storage", true);  
+  DEVICE_ID = preferences.getString("dev_id", "UNASSIGNED");
   
   preferences.end();
+}
+
+void setDeviceID(String newID) {
+  newID.trim();   
+  String currentID = getDeviceID();
+  
+  if (currentID == newID) {
+    Serial.println("[SYSTEM] Device ID is already set to this value. Skipping write.");
+    return;
+  }
+  preferences.begin("storage", false);  
+  preferences.putString("dev_id", newID);
+  
+  preferences.end();
+  
+  Serial.print("[SUCCESS] New Device ID written to flash: ");
+  Serial.println(newID);
 }
 
 String getTime() {
