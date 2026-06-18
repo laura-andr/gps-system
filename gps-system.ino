@@ -20,7 +20,6 @@
 #define _REG_CALIBRATION      0x05
 
 //Error Logs
-#define test 1
 #define ERR_AT_TIMEOUT 100
 #define ERR_AT_FAILURE 101
 #define ERR_GPS_INIT 200
@@ -211,7 +210,6 @@ void loop() {
       }
     }
   } else {
-    addError(test);
     bootCount++;
     if (bootCount == 2){
       bootCount = 0;
