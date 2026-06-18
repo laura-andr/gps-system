@@ -20,6 +20,7 @@
 #define _REG_CALIBRATION      0x05
 
 //Error Logs
+#define test 1
 #define ERR_AT_TIMEOUT 100
 #define ERR_AT_FAILURE 101
 #define ERR_GPS_INIT 200
@@ -43,6 +44,11 @@
 #define ERR_UPDATE_FAILURE 507
 #define ERR_SLEEP 600
 
+struct Error {
+  uint16_t code;
+  uint16_t time;
+};
+
 // begin define constants 
 
   // INA219 Driver Constants & Tracking Variable
@@ -64,7 +70,8 @@ const int LOCAL_VERSION = 0;
 const String dateLastOTA = "000000";
 
   // ota update time
-const String UPDATE_TIME_UTC = "050000.00"; //hhmmss.ss change back to 7
+const String UPDATE_TIME_BEGIN_UTC = "053000.00";
+const String UPDATE_TIME_END_UTC = "070000.00"; //hhmmss.ss change back to 7
 
   // ota urls https://dl.dropboxusercontent.com/scl/fi/.../<filename>?rlkey=...&st=...&dl=1
 const String version_url = "https://dl.dropboxusercontent.com/scl/fi/r0rhfi73h7iciwrlumrls/version.txt?rlkey=ddjovrejh5wg06vr26z63uvmu&st=9zyuv7eo&dl=1";
@@ -111,8 +118,10 @@ int serverVersion = 0;
 int firmwareSize = 0;
 
   // error log global variables
-int errorLog[64];
+const int ERROR_ARRAY_LENGTH = 100;
+Error errorLog[ERROR_ARRAY_LENGTH];
 int errorIndex = 0;
+String dateErrorLogSent = "000000";
 
 // function headers
 void stop();
@@ -121,6 +130,7 @@ void getDeviceID();
 void setDeviceID(String newID);
 String getTime();
 String getDate();
+uint16_t convertHhmmssToMinutes(String utcStr);
 void setupPDP();
 void setupSSL();
 void startSocket();
@@ -134,7 +144,6 @@ void waitForResponse();
 long httpGET(String url);
 int checkVersion();
 void downloadNewVersion();
-void checkAndDoOTA();
 void setupGPS();
 void fixLocation();
 bool getGPS();
@@ -177,8 +186,10 @@ void setup() {
   sendAT("AT", TO_LOCAL);
   delay(1000);
   sendAT("AT+IPR=115200", TO_LOCAL);
+  delay(1000);  
+  sendAT("AT+CRESET", TO_LOCAL);
   delay(1000);
-  
+  sendAT("AT+IPR=115200", TO_LOCAL);
   if (isActive() || bootCount+1 == 2){
     setupGPS();
     setupPDP();
@@ -200,14 +211,26 @@ void loop() {
       }
     }
   } else {
+    addError(test);
     bootCount++;
     if (bootCount == 2){
       bootCount = 0;
+      fixLocation();
       if(getGPS()){
         startSocket();
         sendNmeaSentence();
       }
-      checkAndDoOTA();
+      String curTime = getTime();
+      if (curTime >= UPDATE_TIME_BEGIN_UTC && curTime <= UPDATE_TIME_END_UTC) {
+        String curDate = getDate();
+        if (dateErrorLogSent != curDate){
+          Serial.println("SENDING ERROR LOG");
+          sendErrorLog();
+        }
+        if (dateLastOTA != curDate) {
+          downloadNewVersion();
+        }
+      }
     }
     int count = 0;
     bool failed = false;
@@ -230,14 +253,55 @@ void loop() {
 //helper functions
 void stop() {
   for (int i = 0; i < errorIndex; i++) {
-    Serial.println(errorLog[i]);
+    Serial.println(errorLog[i].time + " " + errorLog[i].code);
   }
   ESP.restart();
 }
 
 void addError(int code) {
   if (errorIndex < 64) {
-    errorLog[errorIndex++] = code;
+    Error error = {code, convertHhmmssToMinutes(getTime())};
+    errorLog[errorIndex++] = error;
+  }
+}
+
+void sendErrorLog(){
+  //send with format [{time, code}, {time, code}...]
+  //errorIndex
+  startSocket();
+  String json = "[";
+  for (int i = 0; i < errorIndex; i++) {
+    Serial.println("ERROR:"+String(errorLog[i].time) + " " + String(errorLog[i].code)); // for testing
+    if (errorLog[i].time != 0 && errorLog[i].code != 0) {
+      json += "{" + String(errorLog[i].time) + "," + String(errorLog[i].code) + "},";
+    }
+  }
+
+  if (json.endsWith(",")) {
+    json.remove(json.length() - 1);
+  }
+  json += "]";
+
+  String payload = ">EL=" + DEVICE_ID + "," + json + "<\r\n";
+
+  if (CIPSEND(payload, locChannel)) {    
+    dateErrorLogSent = getDate();
+    for (int i = 0; i < errorIndex; i++) {
+      nmeaArray[i] = ""; 
+    }
+
+    int writeIndex = 0;
+    for (int i = 0; i < errorIndex; i++) {
+      if (errorLog[i].time != 0 && errorLog[i].code != 0) {
+        if (writeIndex != i) {
+          errorLog[writeIndex] = errorLog[i];
+          errorLog[i].time = 0; 
+          errorLog[i].code = 0; 
+        }
+        writeIndex++;
+      }
+    }    
+    errorIndex = writeIndex;
   }
 }
 
@@ -250,7 +314,8 @@ void getDeviceID() {
 
 void setDeviceID(String newID) {
   newID.trim();   
-  String currentID = getDeviceID();
+  getDeviceID();
+  String currentID = DEVICE_ID;
   
   if (currentID == newID) {
     Serial.println("[SYSTEM] Device ID is already set to this value. Skipping write.");
@@ -283,6 +348,14 @@ String getDate() {
   return "00";
 }
 
+//minutes since midnight utc
+uint16_t convertHhmmssToMinutes(String utcStr) {
+  utcStr = utcStr.substring(0, 7);
+  int hours = utcStr.substring(0, 2).toInt();
+  int minutes = utcStr.substring(2, 4).toInt();
+  
+  return (hours * 60) + minutes;
+}
 // --- Network / AT helpers ---
 
 void setupPDP(){
@@ -361,8 +434,16 @@ void startSocket(){
     setupPDP(); 
   }
 
-  if (!sendATincludes("AT+CIPOPEN?", "+CIPOPEN: " + locChannel + ",", TO_LOCAL)) {
-    ATCIPOPEN(locHost, locPort, locChannel);
+  String socketStatus = sendAT("AT+CIPOPEN?", TO_LOCAL);
+  
+  if (socketStatus.indexOf("+CIPOPEN: "+locChannel+",") == -1 || socketStatus.indexOf(",-1") != -1) {
+    Serial.println("[SOCKET] Channel is dead or lingering (-1). Forcing local close...");
+    
+    sendAT("AT+CIPCLOSE=0", TO_LOCAL);
+    delay(200); 
+    
+    // Now open a fresh connection
+    ATCIPOPEN(locHost, locPort, "0");
   }
 }
 
@@ -830,16 +911,6 @@ void downloadNewVersion() {
   }
 }
 
-void checkAndDoOTA(){
-  String curTime = getTime();
-  if (curTime <= UPDATE_TIME_UTC) {
-    String curDate = getDate();
-    if (dateLastOTA != curDate) {
-      downloadNewVersion();
-    }
-  }
-}
-
 //-- GPS Helpers--
 void setupGPS(){
   sendAT("AT+CGNSSPWR=0", TO_LOCAL);
@@ -860,10 +931,10 @@ void setupGPS(){
       stop();
     }
   }
-  gpsStartTime = millis();
 }
 
 void fixLocation(){
+  gpsStartTime = millis();
   String response = sendAT("AT+CGNSSINFO", TO_LOCAL);
   if (response.indexOf("ERROR") != -1){
     addError(ERR_GPS_INFO);
@@ -1021,9 +1092,11 @@ String addChecksum(String sentence) {
 void addNmeaToArray() {
   if (nmeaIndex >= NMEA_ARRAY_LENGTH) return;
 
-  if (nmeaIndex != 0) {
-    if (!(gpsFields[12].toDouble() > THRESH_SPEED)) return;
+  if (nmeaSentence == "$GPRMC,,V,,,,,,,,,,N,V") return;
 
+  if (!(gpsFields[12].toDouble() > THRESH_SPEED)) return;
+
+  if (nmeaIndex != 0) {
     String lastNmea = nmeaArray[nmeaIndex-1];
     String lastNmeaArray[14];
     csvToArray(lastNmea, ',', lastNmeaArray, 14);
@@ -1128,7 +1201,7 @@ bool CIPSEND(String payload, String channel){
     yield();
   }
   
-  if (channel == locChannel && serverResponse.indexOf("Insertado con identificador") == -1) {
+  if (channel == locChannel && serverResponse.indexOf("000,") != -1 && serverResponse.indexOf("999,Error en el formato de coordenadas") != -1) {
     return false; 
   }
 
