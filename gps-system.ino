@@ -64,7 +64,7 @@ const int LOCAL_VERSION = 0;
 const String dateLastOTA = "000000";
 
   // ota update time
-const String UPDATE_TIME_UTC = "070000.00"; //hhmmss.ss
+const String UPDATE_TIME_UTC = "050000.00"; //hhmmss.ss change back to 7
 
   // ota urls https://dl.dropboxusercontent.com/scl/fi/.../<filename>?rlkey=...&st=...&dl=1
 const String version_url = "https://dl.dropboxusercontent.com/scl/fi/r0rhfi73h7iciwrlumrls/version.txt?rlkey=ddjovrejh5wg06vr26z63uvmu&st=9zyuv7eo&dl=1";
@@ -72,7 +72,7 @@ const String firmware_url = "https://dl.dropboxusercontent.com/scl/fi/1x22iaxccj
 
   // gps constant
 const int ACTIVE_GPS_INTERVAL = 10; // tracking interval in seconds
-const int IDLE_GPS_INTERVAL = 10*60; 
+const int IDLE_GPS_INTERVAL = 2*60; 
 RTC_DATA_ATTR int bootCount = 0;
 
   // send old location constants
@@ -98,7 +98,6 @@ String DEVICE_ID = "000";
 
   // gps global variables
 unsigned long lastLocUpdate;
-unsigned long sinceLastWakeup;
 unsigned long gpsStartTime;
 String gpsData;
 String gpsFields[18];
@@ -178,16 +177,15 @@ void setup() {
   sendAT("AT+IPR=115200", TO_LOCAL);
   delay(1000);
   
-  setupGPS();
-  setupPDP();
-  if (isActive() || bootCount+1 == 3){
+  if (isActive() || bootCount+1 == 2){
+    setupGPS();
+    setupPDP();
     fixLocation();
+    startSocket();
+    setupSSL();
   }
-  startSocket();
-  setupSSL();
 
   lastLocUpdate = millis();
-  sinceLastWakeup = millis();
 }
 
 void loop() {
@@ -201,17 +199,17 @@ void loop() {
     }
   } else {
     bootCount++;
-    if (bootCount == 3){
+    if (bootCount == 2){
       bootCount = 0;
-      checkAndDoOTA();
       if(getGPS()){
         startSocket();
         sendNmeaSentence();
       }
+      checkAndDoOTA();
     }
     int count = 0;
     bool failed = false;
-    while (ESP_OK != esp_sleep_enable_timer_wakeup(IDLE_GPS_INTERVAL/3 * 1000000ULL)){
+    while (ESP_OK != esp_sleep_enable_timer_wakeup(IDLE_GPS_INTERVAL/2 * 1000000ULL)){
       if (count == 3){
         bootCount = 0;
         addError(ERR_SLEEP);
@@ -228,7 +226,6 @@ void loop() {
 }
 
 //helper functions
-
 void stop() {
   for (int i = 0; i < errorIndex; i++) {
     Serial.println(errorLog[i]);
@@ -852,6 +849,7 @@ void setupGPS(){
       stop();
     }
   }
+  gpsStartTime = millis();
 }
 
 void fixLocation(){
@@ -860,7 +858,8 @@ void fixLocation(){
     addError(ERR_GPS_INFO);
     stop();
   }
-  while (sendATincludes("AT+CGNSSINFO", ",,,,,,,,", TO_LOCAL)){
+  while (sendATincludes("AT+CGNSSINFO", ",,,,", TO_LOCAL)){
+    Serial.println(millis() - gpsStartTime);
     if (millis() - gpsStartTime > 480000){
       setupGPS();
       gpsStartTime = millis();
