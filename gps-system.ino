@@ -253,13 +253,13 @@ void loop() {
 //helper functions
 void stop() {
   for (int i = 0; i < errorIndex; i++) {
-    Serial.println(errorLog[i].time + " " + errorLog[i].code);
+    Serial.println(String(errorLog[i].time) + " " + String(errorLog[i].code));
   }
   ESP.restart();
 }
 
 void addError(int code) {
-  if (errorIndex < 64) {
+  if (errorIndex < ERROR_ARRAY_LENGTH) {
     Error error = {code, convertHhmmssToMinutes(getTime())};
     errorLog[errorIndex++] = error;
   }
