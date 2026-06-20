@@ -86,7 +86,6 @@ const int NMEA_ARRAY_LENGTH = 1500; // number old nmea sentences stored
 const int PACKAGE_SIZE = 100; // number old nmea sentences sent at once
 
   // threshold values to limit number of old nmea sentences stored
-const int THRESH_SPEED = 13; //in knots
 const int THRESH_DIST = 300; //in meters
 const int THRESH_BEARING = 10; //in degrees
 
@@ -96,6 +95,8 @@ const unsigned long TO_CELL = 10000;
 const unsigned long TO_SOCKET = 10000;
 
 //begin define global variables
+  // network
+bool networkDown = false;
 
   // device id
 Preferences preferences;
@@ -205,7 +206,6 @@ void loop() {
     if(millis() - lastLocUpdate >= (ACTIVE_GPS_INTERVAL * 1000)){
       lastLocUpdate = millis();
       if (getGPS()){
-        startSocket(); 
         sendNmeaSentence();
       }
     }
@@ -215,7 +215,6 @@ void loop() {
       bootCount = 0;
       fixLocation();
       if(getGPS()){
-        startSocket();
         sendNmeaSentence();
       }
       String curTime = getTime();
@@ -265,11 +264,10 @@ void addError(int code) {
 
 void sendErrorLog(){
   //send with format [{time, code}, {time, code}...]
-  //errorIndex
   startSocket();
   String json = "[";
   for (int i = 0; i < errorIndex; i++) {
-    Serial.println("ERROR:"+String(errorLog[i].time) + " " + String(errorLog[i].code)); // for testing
+    Serial.println("ERROR: "+String(errorLog[i].time) + " " + String(errorLog[i].code));
     if (errorLog[i].time != 0 && errorLog[i].code != 0) {
       json += "{" + String(errorLog[i].time) + "," + String(errorLog[i].code) + "},";
     }
@@ -408,8 +406,6 @@ void setupPDP(){
    addError(ERR_NET_IP);
    stop();
   }
-  //may not be needed
-  sendAT("AT+CGSOCKCONT=1,\"IP\",\"" + APN + "\"", TO_CELL);
 }
 
 void setupSSL(){
@@ -424,28 +420,38 @@ void setupSSL(){
   sendAT("AT+CSSLCFG=\"ciphersuites\",0,0xFFFF", TO_LOCAL);
 }
 
-void startSocket(){
-  String ipResponse = sendAT("AT+CGPADDR=1", TO_LOCAL);
-  if (ipResponse.indexOf("\"\"") != -1 || ipResponse.indexOf("ERROR") != -1 || ipResponse.indexOf("+CGPADDR:") == -1) {
-    sendAT("AT+NETCLOSE", TO_CELL);
-    delay(500);
-    setupPDP(); 
+void recoverNetwork(){
+  Serial.println("[NET] Network is down. Starting recovery...");
+  sendAT("AT+CIPCLOSE=0", TO_LOCAL);
+  delay(100);
+  ATNETCLOSE();
+  delay(1500);
+  String response = sendAT("AT+CEREG?", TO_LOCAL);
+  if (response.indexOf(",1") != -1 || response.indexOf(",5") != -1){
+    Serial.println("[NET] Cell connection recovered");
+    if (ATNETOPEN()) {
+      networkDown = false; 
+      Serial.println("[NET] Stack re-opened successfully.");
+    }
   }
-
-  String socketStatus = sendAT("AT+CIPOPEN?", TO_LOCAL);
-  
-  if (socketStatus.indexOf("+CIPOPEN: "+locChannel+",") == -1 || socketStatus.indexOf(",-1") != -1) {
-    Serial.println("[SOCKET] Channel is dead or lingering (-1). Forcing local close...");
-    
-    sendAT("AT+CIPCLOSE=0", TO_LOCAL);
-    delay(200); 
-    
-    // Now open a fresh connection
-    ATCIPOPEN(locHost, locPort, "0");
+  if (response.indexOf(",0")!=-1){
+    sendAT("AT+CFUN=1", TO_LOCAL);
   }
 }
 
-bool ATNETOPEN(){
+void startSocket(){
+  if (networkDown){
+    recoverNetwork();
+  }
+
+  sendAT("AT+CIPCLOSE=0", TO_LOCAL);
+  delay(150);
+  
+  Serial.println("[SOCKET] Opening fresh link...");
+  ATCIPOPEN(locHost, locPort, "0");
+}
+
+bool ATNETOPEN() {
   unsigned long timeout = TO_CELL;
   for (int tries = 0; tries<4; tries++) {
     bool retry = false;
@@ -454,7 +460,7 @@ bool ATNETOPEN(){
     Serial2.println("AT+NETOPEN");
 
     unsigned long start = millis();
-    while (millis() - start < timeout) {
+    while (millis() - start < timeout/3) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
         Serial.write(c);
@@ -486,11 +492,11 @@ bool ATNETOPEN(){
     addError(ERR_NET_OPEN);
     delay(500);
   }
-  addError(ERR_AT_FAILURE);
+  addError(ERR_AT_TIMEOUT);
   return false;
 }
 
-bool ATNETCLOSE(){
+bool ATNETCLOSE() {
   unsigned long timeout = TO_SOCKET;
   for (int tries = 0; tries<4; tries++) {
     while(Serial2.available()){
@@ -530,7 +536,7 @@ bool ATNETCLOSE(){
     addError(ERR_NET_CLOSE);
     delay(500);
   }
-  addError(ERR_AT_FAILURE);
+  addError(ERR_AT_TIMEOUT);
   return false;
 }
 
@@ -588,11 +594,14 @@ bool ATCIPOPEN(String host, String port, String channel){
 String sendAT(String msg, unsigned long timeout) {
   int numTries = 0;
   while (numTries < 4) {
+    while (Serial2.available() > 0) {
+      Serial2.read(); 
+    }
     String out = "";
     String curLine = "";
     Serial2.println(msg);
     unsigned long start = millis();
-    while (millis() - start < timeout) {
+    while (millis() - start < timeout/3) {
       while (Serial2.available() > 0) {
         char c = Serial2.read();
         Serial.write(c);
@@ -611,11 +620,10 @@ String sendAT(String msg, unsigned long timeout) {
       }
       yield();
     }
-    addError(ERR_AT_TIMEOUT);
     delay(500);
     numTries++;
   }
-  addError(ERR_AT_FAILURE);
+  addError(ERR_AT_TIMEOUT);
   return "ERROR_TIMEOUT";
 }
 
@@ -935,7 +943,6 @@ void fixLocation(){
   gpsStartTime = millis();
   String response = sendAT("AT+CGNSSINFO", TO_LOCAL);
   if (response.indexOf("ERROR") != -1){
-    addError(ERR_GPS_INFO);
     stop();
   }
   while (sendATincludes("AT+CGNSSINFO", ",,,,", TO_LOCAL)){
@@ -1089,10 +1096,9 @@ String addChecksum(String sentence) {
 
 void addNmeaToArray() {
   if (nmeaIndex >= NMEA_ARRAY_LENGTH) return;
+  //fix this
 
   if (nmeaSentence == "$GPRMC,,V,,,,,,,,,,N,V") return;
-
-  if (!(gpsFields[12].toDouble() > THRESH_SPEED)) return;
 
   if (nmeaIndex != 0) {
     String lastNmea = nmeaArray[nmeaIndex-1];
@@ -1114,8 +1120,8 @@ void addNmeaToArray() {
     if (curNmeaArray[6] == "W") curLon = -curLon;
     double curDegrees = curNmeaArray[8].toDouble();
 
-    if (!(distanceMeters(lastLat, lastLon, curLat, curLon) > THRESH_DIST)) return;
-    if (!(abs(curDegrees - lastDegrees) > THRESH_BEARING)) return;
+    if (distanceMeters(lastLat, lastLon, curLat, curLon) < THRESH_DIST) return;
+    if (abs(curDegrees - lastDegrees) < THRESH_BEARING) return;
   }
 
   nmeaArray[nmeaIndex++] = nmeaSentence;
@@ -1207,12 +1213,24 @@ bool CIPSEND(String payload, String channel){
 }
 
 void sendNmeaSentence(){
+  startSocket();
+  
+  if (networkDown) {
+    Serial.println("[SEND] Network is down. Redirecting payload to backup array.");
+    addNmeaToArray();
+    return;
+  }
+
   String payload = ">IU=" + DEVICE_ID + ",+QGPSGNMEA: " + addChecksum(nmeaSentence) + "<\r\n";
-  if(!CIPSEND(payload, locChannel)){
+  
+  if (!CIPSEND(payload, locChannel)) {
+    Serial.println("[SEND] CIPSEND failed! Flagging network as down.");
+    networkDown = true;
     addNmeaToArray();
     addError(ERR_SOCKET_MSG_FAILURE);
   }
-  else{
+  else {
+    Serial.println("[SEND] Current packet sent successfully!");
     if (nmeaIndex > 0) {
       startSocket();
       sendOldNmeaToSocket();
@@ -1344,5 +1362,9 @@ void checkPowerStatus() {
 }
 
 bool isActive(){
-  return INA219_getCurrent_mA() < -15.0;
+  float bus_voltage = INA219_getBusVoltage_V();
+  float p = (bus_voltage - 3.0) / 1.2 * 100.0;
+  if (p > 100.0) p = 100.0;
+  if (p < 0.0) p = 0.0;
+  return INA219_getCurrent_mA() < -15.0 || p >= 99; 
 }
